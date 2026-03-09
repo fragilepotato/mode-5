@@ -113,9 +113,9 @@ while ishandle(fig) && cycle_count < MAX_CYCLES
         [rx_bits_i, snr_i, dbg_i] = bpsk_demodulate( ...
             rx_data_interrog, PREAMBLE_SYMS, fs, length(interrog_bits));
 
-        fprintf('  [DEBUG] Demod: SNR=%.1fdB  start=%d  bits=%d/%d  polarity=%+d\n', ...
+        fprintf('  [DEBUG] Demod: SNR=%.1fdB  start=%d  bits=%d/%d  phase=%.1fdeg\n', ...
             snr_i, dbg_i.data_start, length(rx_bits_i), ...
-            length(interrog_bits), dbg_i.polarity);
+            length(interrog_bits), dbg_i.phase_deg);
 
         if length(rx_bits_i) == length(interrog_bits)
             fprintf('  [DEBUG] Bit errors: %d/%d\n', ...
@@ -174,8 +174,8 @@ while ishandle(fig) && cycle_count < MAX_CYCLES
         [rx_bits_r, snr_r, dbg_r] = bpsk_demodulate( ...
             rx_data_reply, PREAMBLE_SYMS, fs, length(reply_bits));
 
-        fprintf('  [DEBUG] Reply demod: SNR=%.1fdB  start=%d  bits=%d/%d\n', ...
-            snr_r, dbg_r.data_start, length(rx_bits_r), length(reply_bits));
+        fprintf('  [DEBUG] Reply demod: SNR=%.1fdB  start=%d  bits=%d/%d  phase=%.1fdeg\n', ...
+            snr_r, dbg_r.data_start, length(rx_bits_r), length(reply_bits), dbg_r.phase_deg);
 
         if length(rx_bits_r) == length(reply_bits)
             fprintf('  [DEBUG] Reply bit errors: %d/%d\n', ...
@@ -238,42 +238,51 @@ end
 %  BPSK DEMODULATOR
 % =====================================================================
 function [bits, snr_est, dbg] = bpsk_demodulate(rx_sig, preamble_syms, fs, n_bits_expected)
-    sps = round(fs / 1e6);
+    sps      = round(fs / 1e6);
+    rx_sig   = rx_sig(:).';           % row vector, keep complex
 
-    % Step 1: DC removal via moving average on real(rx)
-    % movmean window = 20 µs — tracks slow AD9361 DC ramp only
-    rx_r    = real(rx_sig(:).');
-    dc_win  = round(20 * sps);
-    rx_r    = rx_r - movmean(rx_r, dc_win);
+    % Step 1: Build preamble template (real ±1, chip-oversampled)
+    pre_tmpl = repelem(preamble_syms, sps);
 
-    % Step 2: Build preamble template (BPSK, same chip duration)
-    pre_tmpl = repelem(preamble_syms, sps);   % real-valued template
-
-    % Step 3: Correlate to find frame start
-    [c, lags] = xcorr(rx_r, pre_tmpl);
+    % Step 2: Correlate COMPLEX rx against real preamble.
+    %   xcorr(complex, real) → complex result.
+    %   abs() is phase-invariant → reliable peak regardless of carrier phase.
+    %   angle() at peak = carrier phase offset θ between TX and RX LOs.
+    [c, lags] = xcorr(rx_sig, pre_tmpl);
     [peak_val, pk_idx] = max(abs(c));
-    polarity   = sign(c(pk_idx));             % +1 or -1 (LO phase ambiguity)
-    noise_est  = median(abs(c));
-    snr_est    = 20 * log10(peak_val / (noise_est + eps));
+    noise_est = median(abs(c));
+    snr_est   = 20 * log10(peak_val / (noise_est + eps));
 
+    % Step 3: Rotate signal by -θ to align BPSK constellation to real axis.
+    %   After rotation:  +1 symbol → real component positive
+    %                    -1 symbol → real component negative
+    phase_offset = angle(c(pk_idx));
+    rx_rot = rx_sig .* exp(-1i * phase_offset);
+    rx_r   = real(rx_rot);
+
+    % Step 4: Remove residual DC (AD9361 baseband ramp, 20 µs window)
+    dc_win = round(20 * sps);
+    rx_r   = rx_r - movmean(rx_r, dc_win);
+
+    % Step 5: Data start = preamble start + preamble length
     start_idx  = lags(pk_idx) + 1;
     data_start = start_idx + length(pre_tmpl);
     if data_start < 1, data_start = 1; end
 
-    % Step 4: Decode bits — integrate each bit period, apply polarity
+    % Step 6: Decide each bit by integrating over one symbol period
     n_bits = min(n_bits_expected, floor((length(rx_r) - data_start) / sps));
     bits   = zeros(1, n_bits);
     for k = 0:n_bits-1
         i0 = data_start + k*sps;
         i1 = i0 + sps - 1;
         if i1 > length(rx_r), break; end
-        bits(k+1) = double(polarity * sum(rx_r(i0:i1)) > 0);
+        bits(k+1) = double(sum(rx_r(i0:i1)) > 0);
     end
 
-    dbg.data_start = data_start;
-    dbg.polarity   = polarity;
-    dbg.peak_val   = peak_val;
-    dbg.noise_est  = noise_est;
+    dbg.data_start   = data_start;
+    dbg.phase_deg    = phase_offset * 180 / pi;
+    dbg.peak_val     = peak_val;
+    dbg.noise_est    = noise_est;
 end
 
 % =====================================================================
