@@ -69,10 +69,11 @@ disp(' ');
 % =====================================================================
 %  3. MAIN IFF LOOP
 % =====================================================================
+MAX_CYCLES  = 5;
 cycle_count = 0;
 fig = figure('Name','Mode 5 IFF Monitor','Position',[100 100 950 700]);
 
-while ishandle(fig)
+while ishandle(fig) && cycle_count < MAX_CYCLES
     cycle_count = cycle_count + 1;
     t_str = datestr(now, 'HH:MM:SS');
     fprintf('\n=== IFF Cycle #%d  [%s] ===\n', cycle_count, t_str);
@@ -290,8 +291,9 @@ function tx = dsss_modulate(bits, pn, fs)
     pre_samp  = repelem(pre_chips, samp_per_chip);
 
     guard = zeros(1, samp_per_chip * chips_per_bit);
-    tx = complex(double([guard, pre_samp, baseband, guard].'), 0);
-    tx = tx / max(abs(tx)) * 0.8;               % Normalize
+    sig = double([guard, pre_samp, baseband, guard].');
+    sig = sig / max(abs(sig)) * 0.8;              % Normalize
+    tx  = sig + 1i*1e-12*ones(size(sig));          % Force complex I/Q for Pluto
 end
 
 function [bits, snr_est] = dsss_demodulate(rx_sig, pn, fs)
