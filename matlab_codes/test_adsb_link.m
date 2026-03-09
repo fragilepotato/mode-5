@@ -68,6 +68,7 @@ for g = 1:size(gain_table, 1)
         transmitRepeat(ptx, tx_wave);
         pause(1.0);           % 1 s settle — important at 12 MSPS
         for f = 1:3, zrx(); end   % flush
+        cal_data = zrx();
         release(ptx); release(zrx);
 
         mx = max(abs(cal_data));
