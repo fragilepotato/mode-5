@@ -29,10 +29,12 @@ fs             = 4e6;                % 4 MSPS baseband sample rate
 
 CYCLE_INTERVAL = 5;                  % Seconds between IFF cycles
 
-% Gain settings (low for direct SMA cable — raise for antenna)
-tx_gain_pluto = -30;                 % Pluto TX gain (dB)
-tx_gain_zed   = -10;                 % ZedBoard TX gain (dB)
-rx_gain       = 20;                  % RX gain both sides (dB)
+% Gain settings for DIRECT SMA CABLE connection
+% SMA cable has ~0 dB path loss — use minimum TX and low RX to avoid clipping
+tx_gain_pluto = -50;                 % Pluto TX gain (dB) — very low for cable
+tx_gain_zed   = -20;                 % ZedBoard TX gain (dB)
+rx_gain_zed   = 0;                   % ZedBoard RX gain (dB)
+rx_gain_pluto = 0;                   % Pluto RX gain (dB)
 
 % Mode 5 identity parameters
 interrogator_id = uint16(hex2dec('1A2B'));
@@ -106,14 +108,30 @@ while ishandle(fig) && cycle_count < MAX_CYCLES
             'SamplesPerFrame', length(tx_interrog)*3, ...
             'OutputDataType', 'double', 'ChannelMapping', 1);
         zrx.GainSource = 'Manual';
-        zrx.Gain = rx_gain;
+        zrx.Gain = rx_gain_zed;
 
         transmitRepeat(ptx, tx_interrog);
-        pause(0.3);
+        pause(0.5);                % Extra settle time for SMA cable
+        for flush = 1:3, zrx(); end % Flush stale RX buffer
         rx_data_interrog = zrx();
         release(ptx); release(zrx);
 
-        [rx_bits_i, snr_i] = dsss_demodulate(rx_data_interrog, pn_code, fs);
+        % --- DEBUG: RX signal stats ---
+        rx_mag = abs(rx_data_interrog);
+        fprintf('  [DEBUG] RX samples=%d  max=%.4f  mean=%.4f  std=%.4f\n', ...
+            length(rx_data_interrog), max(rx_mag), mean(rx_mag), std(rx_mag));
+
+        [rx_bits_i, snr_i, dbg_i] = dsss_demodulate(rx_data_interrog, pn_code, fs, length(interrog_bits));
+        fprintf('  [DEBUG] Demod: SNR=%.1f dB  data_start=%d  bits_extracted=%d  expected=%d\n', ...
+            snr_i, dbg_i.data_start, length(rx_bits_i), length(interrog_bits));
+        fprintf('  [DEBUG] TX bits (first 20): %s\n', num2str(interrog_bits(1:min(20,end))));
+        fprintf('  [DEBUG] RX bits (first 20): %s\n', num2str(rx_bits_i(1:min(20,end))));
+        if length(rx_bits_i) == length(interrog_bits)
+            bit_errs = sum(rx_bits_i ~= interrog_bits);
+            fprintf('  [DEBUG] Bit errors: %d / %d  (BER=%.2f%%)\n', ...
+                bit_errs, length(interrog_bits), 100*bit_errs/length(interrog_bits));
+        end
+
         [rx_iid, rx_chal, interrog_ok] = parse_interrogation(rx_bits_i, crypto_key);
 
         if interrog_ok
@@ -150,14 +168,26 @@ while ishandle(fig) && cycle_count < MAX_CYCLES
             'SamplesPerFrame', length(tx_reply)*3, ...
             'OutputDataType', 'double');
         prx.GainSource = 'Manual';
-        prx.Gain = rx_gain;
+        prx.Gain = rx_gain_pluto;
 
         transmitRepeat(ztx, tx_reply);
-        pause(0.3);
+        pause(0.5);
+        for flush = 1:3, prx(); end % Flush stale RX buffer
         rx_data_reply = prx();
         release(ztx); release(prx);
 
-        [rx_bits_r, snr_r] = dsss_demodulate(rx_data_reply, pn_code, fs);
+        % --- DEBUG: Reply RX signal stats ---
+        rx_mag_r = abs(rx_data_reply);
+        fprintf('  [DEBUG] Reply RX samples=%d  max=%.4f  mean=%.4f\n', ...
+            length(rx_data_reply), max(rx_mag_r), mean(rx_mag_r));
+
+        [rx_bits_r, snr_r, dbg_r] = dsss_demodulate(rx_data_reply, pn_code, fs, length(reply_bits));
+        fprintf('  [DEBUG] Reply demod: SNR=%.1f dB  data_start=%d  bits=%d  expected=%d\n', ...
+            snr_r, dbg_r.data_start, length(rx_bits_r), length(reply_bits));
+        if length(rx_bits_r) == length(reply_bits)
+            fprintf('  [DEBUG] Reply bit errors: %d / %d\n', ...
+                sum(rx_bits_r ~= reply_bits), length(reply_bits));
+        end
         [rx_tid, rx_ifc, ~, reply_ok] = ...
             parse_reply(rx_bits_r, challenge, crypto_key);
 
@@ -231,7 +261,10 @@ end
 % =====================================================================
 function [iid, chal, valid] = parse_interrogation(bits, key)
     valid = false; iid = 0; chal = uint32(0);
-    if length(bits) < 120, return; end
+    if length(bits) < 120
+        fprintf('  [DEBUG PARSE] Too few bits: %d (need 120)\n', length(bits));
+        return;
+    end
 
     sync  = bits(1:16);
     mtype = bits(17:24);
@@ -240,9 +273,26 @@ function [iid, chal, valid] = parse_interrogation(bits, key)
     mac_b = bits(73:104);
     crc_b = bits(105:120);
 
-    if ~isequal(sync, [1 0 1 0 1 0 1 0 1 1 0 0 1 1 0 0]), return; end
-    if compute_crc16(bits(1:104)) ~= binvec2dec(crc_b), return; end
-    if compute_mac([mtype, id_b, ch_b], key) ~= binvec2dec(mac_b), return; end
+    expected_sync = [1 0 1 0 1 0 1 0 1 1 0 0 1 1 0 0];
+    if ~isequal(sync, expected_sync)
+        fprintf('  [DEBUG PARSE] Sync FAIL: got [%s]  expect [%s]\n', ...
+            num2str(sync), num2str(expected_sync));
+        return;
+    end
+
+    crc_calc = compute_crc16(bits(1:104));
+    crc_recv = binvec2dec(crc_b);
+    if crc_calc ~= crc_recv
+        fprintf('  [DEBUG PARSE] CRC FAIL: calc=0x%04X  recv=0x%04X\n', crc_calc, crc_recv);
+        return;
+    end
+
+    mac_calc = compute_mac([mtype, id_b, ch_b], key);
+    mac_recv = binvec2dec(mac_b);
+    if mac_calc ~= mac_recv
+        fprintf('  [DEBUG PARSE] MAC FAIL: calc=0x%08X  recv=0x%08X\n', mac_calc, mac_recv);
+        return;
+    end
 
     iid  = binvec2dec(id_b);
     chal = uint32(binvec2dec(ch_b));
@@ -296,25 +346,45 @@ function tx = dsss_modulate(bits, pn, fs)
     tx  = sig + 1i*1e-12*ones(size(sig));          % Force complex I/Q for Pluto
 end
 
-function [bits, snr_est] = dsss_demodulate(rx_sig, pn, fs)
+function [bits, snr_est, dbg] = dsss_demodulate(rx_sig, pn, fs, expected_bits)
+    if nargin < 4, expected_bits = 0; end
     chips_per_bit = length(pn);
     samp_per_chip = round(fs / 1e6);
 
     rx = real(rx_sig(:).');
     rx = rx - mean(rx);                          % Remove DC
 
+    % Highpass filter to remove any DC ramp from AD9361
+    try
+        rx = highpass(rx, 50e3, fs);
+    catch
+        rx = [0, diff(rx)];
+    end
+
     pn_samp  = repelem(pn, samp_per_chip);
     pre_tmpl = repelem([pn, -pn], samp_per_chip);
 
     [corr_pre, lags] = xcorr(rx, pre_tmpl);
-    [~, pk] = max(abs(corr_pre));
+    [peak_val, pk] = max(abs(corr_pre));
     data_start = lags(pk) + length(pre_tmpl) + 1;
 
     noise_floor = median(abs(corr_pre));
-    snr_est = 20*log10(max(abs(corr_pre)) / (noise_floor + eps));
+    snr_est = 20*log10(peak_val / (noise_floor + eps));
 
     samp_per_bit = chips_per_bit * samp_per_chip;
-    n_bits = floor((length(rx) - data_start) / samp_per_bit);
+
+    % Determine how many bits to extract
+    max_possible = floor((length(rx) - max(data_start,1)) / samp_per_bit);
+    if expected_bits > 0
+        n_bits = min(expected_bits, max(max_possible, 0));
+    else
+        n_bits = max(max_possible, 0);
+    end
+
+    % Protect against bad sync (data_start < 1)
+    if data_start < 1
+        data_start = 1;
+    end
 
     bits = zeros(1, n_bits);
     for k = 0:n_bits-1
@@ -323,6 +393,12 @@ function [bits, snr_est] = dsss_demodulate(rx_sig, pn, fs)
         if i1 > length(rx), break; end
         bits(k+1) = double(sum(rx(i0:i1) .* pn_samp) > 0);
     end
+
+    dbg.data_start  = data_start;
+    dbg.peak_val    = peak_val;
+    dbg.noise_floor = noise_floor;
+    dbg.n_bits      = n_bits;
+    dbg.samp_per_bit = samp_per_bit;
 end
 
 % =====================================================================
