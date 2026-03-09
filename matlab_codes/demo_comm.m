@@ -30,11 +30,11 @@ fs             = 4e6;                % 4 MSPS baseband sample rate
 CYCLE_INTERVAL = 5;                  % Seconds between IFF cycles
 
 % Gain settings for DIRECT SMA CABLE connection
-% SMA cable has ~0 dB path loss — use minimum TX and low RX to avoid clipping
-tx_gain_pluto = -50;                 % Pluto TX gain (dB) — very low for cable
-tx_gain_zed   = -20;                 % ZedBoard TX gain (dB)
-rx_gain_zed   = 0;                   % ZedBoard RX gain (dB)
-rx_gain_pluto = 0;                   % Pluto RX gain (dB)
+% SMA cable has ~0 dB path loss but still need enough amplitude for ADC
+tx_gain_pluto = -10;                 % Pluto TX gain (dB)
+tx_gain_zed   = -10;                 % ZedBoard TX gain (dB)
+rx_gain_zed   = 30;                  % ZedBoard RX gain (dB)
+rx_gain_pluto = 30;                  % Pluto RX gain (dB)
 
 % Mode 5 identity parameters
 interrogator_id = uint16(hex2dec('1A2B'));
