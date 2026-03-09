@@ -291,57 +291,68 @@ end
 %  ADS-B DECODER
 % =====================================================================
 function [bits, hex_str, found, peak_val] = adsb_decode(rx_data, fs)
-    bits = []; hex_str = ''; found = false;
+    bits = []; hex_str = ''; found = false; peak_val = 0;
 
-    sps = round(fs / 1e6);
-    pulse_w = round(0.5 * sps);
+    sps     = round(fs / 1e6);       % 4 samples/bit at 4 MSPS
+    pulse_w = round(0.5 * sps);      % 2 samples/half-bit
 
-    % Magnitude with DC removal
-    mag = abs(rx_data);
-    mag = mag - mean(mag);
-
-    % Highpass filter to remove AD9361 DC ramp
+    % ----------------------------------------------------------------
+    % KEY FIX: highpass the complex IQ signal (removes AD9361 DC ramp
+    % at the source), then envelope detect with abs().
+    % This preserves pulse energy in each half-bit correctly.
+    % Previously we did abs(highpass(abs(IQ))) which acts as an edge
+    % detector and inverts the PPM energy comparison.
+    % ----------------------------------------------------------------
     try
-        mag_filt = highpass(double(mag), 50e3, fs);
+        rx_ac = highpass(rx_data, 50e3, fs);   % AC-couple complex IQ
     catch
-        mag_filt = [0; diff(mag)];
+        rx_ac = rx_data - mean(rx_data);        % fallback: mean sub
     end
-    mag_filt = abs(mag_filt);
+    mag = abs(rx_ac);   % envelope: high during pulse, low during gap
 
-    % Build preamble correlation kernel
+    % Build bipolar preamble kernel (same pulse positions as TX)
     kernel = zeros(round(8 * sps), 1);
     for t = round([0, 1, 3.5, 4.5] * sps) + 1
         kernel(t : t + pulse_w - 1) = 1;
     end
-    kernel = kernel * 2 - 1;  % bipolar
+    kernel = kernel * 2 - 1;   % bipolar: pulse=+1, gap=-1
 
-    % Correlate
-    [c, lags] = xcorr(mag_filt, kernel);
+    % Correlate envelope with preamble kernel
+    [c, lags] = xcorr(mag, kernel);
     [peak_val, pk_idx] = max(c);
 
-    % Adaptive threshold: peak must be well above noise
+    % Threshold: peak must be at least 5x noise floor
     noise = median(abs(c));
-    threshold = noise * 3;
-
-    if peak_val < threshold
+    if peak_val < noise * 5
+        fprintf('  [DECODE] Preamble not found (peak=%.2f noise=%.2f ratio=%.1f)\n', ...
+            peak_val, noise, peak_val/(noise+eps));
         return;
     end
 
     found = true;
-    start_idx = lags(pk_idx);
 
-    % Jump past preamble -> data start
+    % lags from xcorr are 0-based shifts; add +1 for MATLAB 1-based index
+    start_idx  = lags(pk_idx) + 1;
     data_start = start_idx + round(8 * sps);
 
-    % Demodulate 112 bits (PPM)
+    fprintf('  [DECODE] Preamble at sample %d  data_start=%d  SNR=%.1f dB\n', ...
+        start_idx, data_start, 20*log10(peak_val/(noise+eps)));
+
+    if data_start < 1
+        data_start = 1;
+    end
+
+    % Decode 112 PPM bits using the clean envelope
     bits = zeros(1, 112);
     for k = 0:111
         idx = data_start + k * sps;
-        if (idx + sps - 1) > length(mag_filt), break; end
+        if (idx + sps - 1) > length(mag), break; end
 
-        chunk = mag_filt(idx : idx + sps - 1);
-        half = floor(length(chunk) / 2);
+        chunk = mag(idx : idx + sps - 1);
+        half  = floor(length(chunk) / 2);
 
+        % PPM: 1 = pulse in first half (more energy first)
+        %      0 = pulse in second half (more energy second)
         if sum(chunk(1:half)) > sum(chunk(half+1:end))
             bits(k+1) = 1;
         else
@@ -351,11 +362,11 @@ function [bits, hex_str, found, peak_val] = adsb_decode(rx_data, fs)
 
     % Bits -> Hex
     hex_str = '';
-    chars = '0123456789ABCDEF';
-    for i = 1:4:length(bits)
+    chars   = '0123456789ABCDEF';
+    for i = 1:4:112
         if i+3 > length(bits), break; end
         chunk = bits(i:i+3);
-        val = chunk(1)*8 + chunk(2)*4 + chunk(3)*2 + chunk(4);
+        val   = chunk(1)*8 + chunk(2)*4 + chunk(3)*2 + chunk(4);
         hex_str = [hex_str, chars(val+1)];
     end
 end
