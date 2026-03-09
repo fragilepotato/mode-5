@@ -10,18 +10,18 @@ ip_pluto = 'ip:192.168.2.1';
 ip_zed   = '192.168.1.10';
 
 fc = 1090e6;                         % 1090 MHz (ADS-B frequency)
-fs = 4e6;                            % 4 MSPS
+fs = 12e6;                           % 12 MSPS — ADS-B standard (12 samp/us = 6 per half-bit pulse)
 
 MAX_CYCLES     = 5;
 CYCLE_INTERVAL = 5;                  % seconds
 
-% --- GAIN SWEEP: try multiple gain combos automatically ---
-% We'll test 3 gain settings and pick the one that gives best BER.
+% Gain table for auto-calibration [TX_pluto, RX_zed]
+% At 12 MSPS we need higher TX drive to get enough amplitude
 gain_table = [
 %   TX_pluto  RX_zed
-    -30       5
-    -20       10
-    -10       15
+    -30       30
+    -20       25
+    -10       20
 ];
 
 msg_hex = '8D4840D6202CC371C32CE0576098';   % Standard ADS-B test message
@@ -60,15 +60,14 @@ for g = 1:size(gain_table, 1)
 
         zrx = sdrrx('AD936x', 'IPAddress', ip_zed, ...
             'CenterFrequency', fc, 'BasebandSampleRate', fs, ...
-            'SamplesPerFrame', length(tx_wave)*2, ...
+            'SamplesPerFrame', length(tx_wave)*4, ...
             'OutputDataType', 'double', 'ChannelMapping', 1);
         zrx.GainSource = 'Manual';
         zrx.Gain = rg;
 
         transmitRepeat(ptx, tx_wave);
-        pause(0.5);
+        pause(1.0);           % 1 s settle — important at 12 MSPS
         for f = 1:3, zrx(); end   % flush
-        cal_data = zrx();
         release(ptx); release(zrx);
 
         mx = max(abs(cal_data));
@@ -121,14 +120,14 @@ for cycle = 1:MAX_CYCLES
         % --- RX (ZedBoard) ---
         zrx = sdrrx('AD936x', 'IPAddress', ip_zed, ...
             'CenterFrequency', fc, 'BasebandSampleRate', fs, ...
-            'SamplesPerFrame', length(tx_wave)*2, ...
+            'SamplesPerFrame', length(tx_wave)*4, ...
             'OutputDataType', 'double', 'ChannelMapping', 1);
         zrx.GainSource = 'Manual';
         zrx.Gain = rx_gain;
 
         transmitRepeat(ptx, tx_wave);
-        pause(0.5);
-        for f = 1:3, zrx(); end   % flush stale buffer
+        pause(1.0);                  % 1 s settle at 12 MSPS
+        for f = 1:3, zrx(); end      % flush stale buffer
         data_rx = zrx();
         release(ptx); release(zrx);
 
@@ -293,66 +292,68 @@ end
 function [bits, hex_str, found, peak_val] = adsb_decode(rx_data, fs)
     bits = []; hex_str = ''; found = false; peak_val = 0;
 
-    sps     = round(fs / 1e6);       % 4 samples/bit at 4 MSPS
-    pulse_w = round(0.5 * sps);      % 2 samples/half-bit
+    sps     = round(fs / 1e6);       % 12 samples/us at 12 MSPS
+    pulse_w = round(0.5 * sps);      % 6 samples per half-bit pulse
 
     % ----------------------------------------------------------------
-    % KEY FIX: highpass the complex IQ signal (removes AD9361 DC ramp
-    % at the source), then envelope detect with abs().
-    % This preserves pulse energy in each half-bit correctly.
-    % Previously we did abs(highpass(abs(IQ))) which acts as an edge
-    % detector and inverts the PPM energy comparison.
+    % DC removal via moving average (window = 20 us).
+    % DO NOT use highpass() here — it destroys narrow PPM pulses by
+    % ringing. Moving average subtraction removes only the slow AD9361
+    % DC ramp without touching pulse structure.
     % ----------------------------------------------------------------
-    try
-        rx_ac = highpass(rx_data, 50e3, fs);   % AC-couple complex IQ
-    catch
-        rx_ac = rx_data - mean(rx_data);        % fallback: mean sub
-    end
-    mag = abs(rx_ac);   % envelope: high during pulse, low during gap
+    mag = abs(rx_data(:));                        % envelope
+    dc_window = round(20 * sps);                  % 20 us window
+    mag_dc = movmean(mag, dc_window);             % slow DC baseline
+    mag = mag - mag_dc;                           % remove baseline
+    mag = max(mag, 0);                            % keep positive only
+    mag = mag / (max(mag) + eps);                 % normalise 0->1
 
-    % Build bipolar preamble kernel (same pulse positions as TX)
-    kernel = zeros(round(8 * sps), 1);
-    for t = round([0, 1, 3.5, 4.5] * sps) + 1
-        kernel(t : t + pulse_w - 1) = 1;
+    % Build bipolar preamble kernel
+    % ADS-B preamble: pulses at 0, 1, 3.5, 4.5 us (each 0.5 us wide)
+    kern_len = round(8 * sps);
+    kernel   = -ones(kern_len, 1);                % baseline = -1
+    for t_us = [0, 1, 3.5, 4.5]
+        t0 = round(t_us * sps) + 1;
+        t1 = min(t0 + pulse_w - 1, kern_len);
+        kernel(t0:t1) = 1;                        % pulse = +1
     end
-    kernel = kernel * 2 - 1;   % bipolar: pulse=+1, gap=-1
 
-    % Correlate envelope with preamble kernel
+    % Correlate
     [c, lags] = xcorr(mag, kernel);
     [peak_val, pk_idx] = max(c);
+    noise     = median(abs(c));
+    snr_ratio = peak_val / (noise + eps);
 
-    % Threshold: peak must be at least 5x noise floor
-    noise = median(abs(c));
-    if peak_val < noise * 5
-        fprintf('  [DECODE] Preamble not found (peak=%.2f noise=%.2f ratio=%.1f)\n', ...
-            peak_val, noise, peak_val/(noise+eps));
+    fprintf('  [DECODE] corr_peak=%.3f  noise=%.3f  ratio=%.1f\n', ...
+        peak_val, noise, snr_ratio);
+
+    if snr_ratio < 4
+        fprintf('  [DECODE] Preamble not found (need ratio >= 4)\n');
         return;
     end
 
     found = true;
 
-    % lags from xcorr are 0-based shifts; add +1 for MATLAB 1-based index
+    % xcorr lags are signed; convert to MATLAB 1-based sample index
     start_idx  = lags(pk_idx) + 1;
-    data_start = start_idx + round(8 * sps);
+    data_start = start_idx + kern_len;
 
-    fprintf('  [DECODE] Preamble at sample %d  data_start=%d  SNR=%.1f dB\n', ...
-        start_idx, data_start, 20*log10(peak_val/(noise+eps)));
+    fprintf('  [DECODE] Preamble at sample %d  data_start=%d\n', ...
+        start_idx, data_start);
 
-    if data_start < 1
-        data_start = 1;
-    end
+    if data_start < 1, data_start = 1; end
 
-    % Decode 112 PPM bits using the clean envelope
+    % Decode 112 PPM bits
     bits = zeros(1, 112);
     for k = 0:111
-        idx = data_start + k * sps;
-        if (idx + sps - 1) > length(mag), break; end
+        i0 = data_start + k * sps;
+        i1 = i0 + sps - 1;
+        if i1 > length(mag), break; end
 
-        chunk = mag(idx : idx + sps - 1);
-        half  = floor(length(chunk) / 2);
+        chunk = mag(i0:i1);
+        half  = floor(sps / 2);
 
-        % PPM: 1 = pulse in first half (more energy first)
-        %      0 = pulse in second half (more energy second)
+        % 1 = pulse in first half,  0 = pulse in second half
         if sum(chunk(1:half)) > sum(chunk(half+1:end))
             bits(k+1) = 1;
         else
@@ -365,8 +366,7 @@ function [bits, hex_str, found, peak_val] = adsb_decode(rx_data, fs)
     chars   = '0123456789ABCDEF';
     for i = 1:4:112
         if i+3 > length(bits), break; end
-        chunk = bits(i:i+3);
-        val   = chunk(1)*8 + chunk(2)*4 + chunk(3)*2 + chunk(4);
-        hex_str = [hex_str, chars(val+1)];
+        v = bits(i)*8 + bits(i+1)*4 + bits(i+2)*2 + bits(i+3);
+        hex_str = [hex_str, chars(v+1)];
     end
 end
