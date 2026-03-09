@@ -31,10 +31,11 @@ CYCLE_INTERVAL = 5;                  % Seconds between IFF cycles
 
 % Gain settings for DIRECT SMA CABLE connection
 % SMA cable has ~0 dB path loss but still need enough amplitude for ADC
-tx_gain_pluto = -10;                 % Pluto TX gain (dB)
-tx_gain_zed   = -10;                 % ZedBoard TX gain (dB)
-rx_gain_zed   = 30;                  % ZedBoard RX gain (dB)
-rx_gain_pluto = 30;                  % Pluto RX gain (dB)
+% Target RX max amplitude ~0.2-0.5 (not clipping at 1.414, not buried at 0.003)
+tx_gain_pluto = -20;                 % Pluto TX gain (dB)
+tx_gain_zed   = -20;                 % ZedBoard TX gain (dB)
+rx_gain_zed   = 10;                  % ZedBoard RX gain (dB)
+rx_gain_pluto = 10;                  % Pluto RX gain (dB)
 
 % Mode 5 identity parameters
 interrogator_id = uint16(hex2dec('1A2B'));
