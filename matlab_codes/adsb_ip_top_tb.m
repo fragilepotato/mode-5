@@ -1,40 +1,44 @@
 function adsb_ip_top_tb()
-%% ADSB_IP_TOP_TB  Test bench for HDL Coder float-to-fixed range analysis
+%% ADSB_IP_TOP_TB  Test bench for integer-arithmetic HDL Coder DUT
 %
-%  Exercises adsb_ip_top with:
-%    Test 1 — Clean interrogation frame  (expect valid_flag = true, 0% BER)
-%    Test 2 — Noisy interrogation frame  (expect valid_flag = true, low BER)
-%    Test 3 — Noise-only frame           (expect valid_flag = false)
-%    Test 4 — Weak-signal frame          (SNR near threshold)
+%  Generates ADS-B PPM waveforms in floating-point, converts to int16
+%  (matching AD9361 ADC output format), then calls adsb_ip_top(re, im).
 %
-%  This file is consumed by HDL Coder's -float2fixed pipeline to
-%  determine the dynamic range of every internal variable in adsb_ip_top.
-%  It is NOT synthesized — only the DUT (adsb_ip_top) goes to hardware.
+%  Test 1 — Clean interrogation   (expect valid = true,  0% BER)
+%  Test 2 — Noisy interrogation   (expect valid = true,  low BER)
+%  Test 3 — Noise-only            (expect valid = false)
+%  Test 4 — Weak signal           (boundary condition, info only)
+%
+%  This file is NOT synthesized — only adsb_ip_top goes to hardware.
 
 FRAME_LEN = 6528;
 fs        = 12e6;
+ADC_SCALE = 30000;   % map normalized [0,1] → int16 range (keep headroom)
 
-% Known interrogation: [DF=B0][ID=1A2B][Mode=05][Challenge=D2CE21DA][CRC=000000]
+% Known interrogation frame
 interrog_hex = 'B01A2B05D2CE21DA000000';   % 22 hex = 88 bits
 pass_count   = 0;
 fail_count   = 0;
 
 fprintf('========================================================\n');
-fprintf('   adsb_ip_top — HDL Coder Test Bench\n');
+fprintf('   adsb_ip_top — Integer HDL Coder Test Bench\n');
 fprintf('========================================================\n\n');
+
+% Generate reference waveform (float)
+[tx_wave, tx_bits] = tb_adsb_modulate(interrog_hex, fs);
 
 % -----------------------------------------------------------------
 %  TEST 1 — Clean interrogation (no noise)
 % -----------------------------------------------------------------
 fprintf('--- Test 1: Clean interrogation ---\n');
-[tx_wave, tx_bits] = tb_adsb_modulate(interrog_hex, fs);
-rx_frame = tb_pad_frame(tx_wave, FRAME_LEN) * 0.5;
+rx_float = tb_pad_frame(tx_wave, FRAME_LEN) * 0.5;
+[rx_re, rx_im] = tb_float_to_int16(rx_float, ADC_SCALE);
 
-[rx_bits, valid] = adsb_ip_top(rx_frame);
+[rx_bits, valid] = adsb_ip_top(rx_re, rx_im);
 
 if valid
-    rx_hex = tb_bits2hex(rx_bits);
-    ber    = sum(rx_bits ~= tx_bits(1:88)) / 88;
+    rx_hex = tb_bits2hex(double(rx_bits));
+    ber    = sum(double(rx_bits) ~= tx_bits(1:88)) / 88;
     fprintf('  Valid   : YES\n');
     fprintf('  Decoded : %s\n', rx_hex);
     fprintf('  Expected: %s\n', interrog_hex);
@@ -57,13 +61,14 @@ end
 fprintf('--- Test 2: Noisy interrogation (SNR ~20 dB) ---\n');
 rng(42);
 noise    = 0.005 * (randn(FRAME_LEN,1) + 1i*randn(FRAME_LEN,1));
-rx_frame = tb_pad_frame(tx_wave, FRAME_LEN) * 0.4 + noise;
+rx_float = tb_pad_frame(tx_wave, FRAME_LEN) * 0.4 + noise;
+[rx_re, rx_im] = tb_float_to_int16(rx_float, ADC_SCALE);
 
-[rx_bits, valid] = adsb_ip_top(rx_frame);
+[rx_bits, valid] = adsb_ip_top(rx_re, rx_im);
 
 if valid
-    rx_hex = tb_bits2hex(rx_bits);
-    ber    = sum(rx_bits ~= tx_bits(1:88)) / 88;
+    rx_hex = tb_bits2hex(double(rx_bits));
+    ber    = sum(double(rx_bits) ~= tx_bits(1:88)) / 88;
     fprintf('  Valid   : YES\n');
     fprintf('  Decoded : %s\n', rx_hex);
     fprintf('  BER     : %.1f%%\n', ber*100);
@@ -85,8 +90,9 @@ end
 fprintf('--- Test 3: Noise-only ---\n');
 rng(99);
 rx_noise = 0.01 * (randn(FRAME_LEN,1) + 1i*randn(FRAME_LEN,1));
+[rx_re, rx_im] = tb_float_to_int16(rx_noise, ADC_SCALE);
 
-[~, valid] = adsb_ip_top(rx_noise);
+[~, valid] = adsb_ip_top(rx_re, rx_im);
 
 if ~valid
     fprintf('  Valid: NO — PASS (correctly rejected noise)\n\n');
@@ -97,18 +103,19 @@ else
 end
 
 % -----------------------------------------------------------------
-%  TEST 4 — Weak signal (SNR near threshold)
+%  TEST 4 — Weak signal (near threshold)
 % -----------------------------------------------------------------
 fprintf('--- Test 4: Weak signal (near threshold) ---\n');
 rng(7);
 noise    = 0.02 * (randn(FRAME_LEN,1) + 1i*randn(FRAME_LEN,1));
-rx_frame = tb_pad_frame(tx_wave, FRAME_LEN) * 0.08 + noise;
+rx_float = tb_pad_frame(tx_wave, FRAME_LEN) * 0.08 + noise;
+[rx_re, rx_im] = tb_float_to_int16(rx_float, ADC_SCALE);
 
-[rx_bits, valid] = adsb_ip_top(rx_frame);
+[rx_bits, valid] = adsb_ip_top(rx_re, rx_im);
 
-fprintf('  Valid: %s\n', tf_str(valid));
+fprintf('  Valid: %s\n', tb_tf(valid));
 if valid
-    ber = sum(rx_bits ~= tx_bits(1:88)) / 88;
+    ber = sum(double(rx_bits) ~= tx_bits(1:88)) / 88;
     fprintf('  BER  : %.1f%%\n', ber*100);
 end
 fprintf('  >> INFO (boundary condition — either result acceptable)\n\n');
@@ -125,11 +132,18 @@ fprintf('========================================================\n');
 end
 
 % #####################################################################
-%  TEST BENCH HELPERS  (not synthesized)
+%  TEST BENCH HELPERS  (floating-point, not synthesized)
 % #####################################################################
 
+function [re_i16, im_i16] = tb_float_to_int16(cx_float, scale)
+% Convert complex double waveform to split int16 I/Q
+%   Mimics AD9361 ADC output: 12-bit values in 16-bit container
+    re_i16 = int16(real(cx_float) * scale);
+    im_i16 = int16(imag(cx_float) * scale);
+end
+
 function [waveform, bits] = tb_adsb_modulate(hexStr, fs)
-% Same modulation as prototype — generates ADS-B PPM waveform
+% ADS-B PPM modulation (same as prototype)
     bits = [];
     for i = 1:length(hexStr)
         bits = [bits, bitget(hex2dec(hexStr(i)), 4:-1:1)]; %#ok<AGROW>
@@ -156,7 +170,6 @@ function [waveform, bits] = tb_adsb_modulate(hexStr, fs)
 end
 
 function frame = tb_pad_frame(tx_wave, frame_len)
-% Pad or trim waveform to exactly frame_len samples (column vector)
     n = length(tx_wave);
     if n >= frame_len
         frame = tx_wave(1:frame_len);
@@ -174,6 +187,6 @@ function h = tb_bits2hex(bits)
     end
 end
 
-function s = tf_str(v)
+function s = tb_tf(v)
     if v, s = 'YES'; else, s = 'NO'; end
 end
