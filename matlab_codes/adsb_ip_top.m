@@ -100,8 +100,12 @@ for p = 1:4
     end
 end
 
-% Slide kernel over envelope, track peak and accumulate |corr| for SNR
-best_corr      = 0.0;
+% Slide kernel over envelope, track MAXIMUM correlation (not abs)
+%   The preamble always produces a positive correlation because the kernel
+%   +1 positions align with actual pulses.  Using abs() would let a large
+%   NEGATIVE correlation (signal energy on -1 kernel positions) in the data
+%   region steal the peak — causing wrong data_start and ~50% BER.
+best_corr      = -1e30;   % must start negative so any real peak wins
 best_pos       = 1;
 corr_abs_total = 0.0;
 
@@ -110,10 +114,9 @@ for i = 1:SEARCH_LEN
     for j = 1:KERN_LEN
         c = c + mag(i + j - 1) * kernel(j);
     end
-    c_abs = abs(c);
-    corr_abs_total = corr_abs_total + c_abs;
-    if c_abs > best_corr
-        best_corr = c_abs;
+    corr_abs_total = corr_abs_total + abs(c);   % SNR denominator
+    if c > best_corr                            % max(c), NOT max(abs(c))
+        best_corr = c;
         best_pos  = i;
     end
 end

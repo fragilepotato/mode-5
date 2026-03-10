@@ -90,28 +90,16 @@ disp('  Fixed-point config ready (18-bit word, auto fraction length).');
 disp('[4/5] Configuring HDL generation ...');
 
 hdlcfg = coder.config('hdl');
-
-% --- Target language ---
 hdlcfg.TargetLanguage = 'Verilog';
 
-% --- Synthesis tool + device (ZedBoard) ---
-hdlcfg.SynthesisTool           = 'Xilinx Vivado';
-hdlcfg.SynthesisToolChipFamily = 'Zynq';
-hdlcfg.SynthesisToolDeviceName = 'xc7z020';
-hdlcfg.SynthesisToolPackageName = 'clg484';
-hdlcfg.SynthesisToolSpeedValue  = '-1';
+% Output folder (created automatically by codegen -d flag)
+hdl_output_dir = fullfile(pwd, '..', 'hdl_prj');
+if ~exist(hdl_output_dir, 'dir')
+    mkdir(hdl_output_dir);
+end
 
-% --- Output folder ---
-hdlcfg.TargetDirectory = fullfile(pwd, '..', 'hdl_prj', 'hdlsrc');
-
-% --- Reports + optimizations ---
-hdlcfg.GenerateReport        = true;
-hdlcfg.GenerateHDLTestBench  = true;   % Verilog testbench for ModelSim/Vivado sim
-hdlcfg.OptimizeForTiming     = true;
-hdlcfg.InputPipelining       = true;
-hdlcfg.OutputPipelining      = true;
-
-disp('  HDL config ready (Verilog, xc7z020clg484-1).');
+disp('  HDL config ready (Verilog).'); 
+fprintf('  Output will be in: %s\n', hdl_output_dir);
 
 % =====================================================================
 %  5. GENERATE HDL
@@ -131,7 +119,7 @@ disp('       (Running range analysis → fixed-point → Verilog pipeline)');
 FRAME_LEN = 6528;
 input_type = {complex(zeros(FRAME_LEN, 1))};
 
-codegen -float2fixed fxptcfg -config hdlcfg adsb_ip_top -args input_type
+codegen -float2fixed fxptcfg -config hdlcfg adsb_ip_top -args input_type -d hdl_output_dir
 
 disp(' ');
 disp('========================================================');
