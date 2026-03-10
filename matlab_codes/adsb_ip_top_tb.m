@@ -1,48 +1,45 @@
 function adsb_ip_top_tb()
-%% ADSB_IP_TOP_TB  Test bench for integer-arithmetic HDL Coder DUT
+%% ADSB_IP_TOP_TB  Streaming test bench — feeds samples one at a time
 %
-%  Generates ADS-B PPM waveforms in floating-point, converts to int16
-%  (matching AD9361 ADC output format), then calls adsb_ip_top(re, im).
+%  Generates ADS-B PPM IQ waveforms, quantizes to int16, then calls
+%  adsb_ip_top once per sample (simulating the hardware clock).
+%  Collects decoded bits from bit_valid strobes and verifies them.
 %
-%  Test 1 — Clean interrogation   (expect valid = true,  0% BER)
-%  Test 2 — Noisy interrogation   (expect valid = true,  low BER)
-%  Test 3 — Noise-only            (expect valid = false)
-%  Test 4 — Weak signal           (boundary condition, info only)
-%
-%  This file is NOT synthesized — only adsb_ip_top goes to hardware.
+%  Test 1 — Clean interrogation   (expect 0% BER)
+%  Test 2 — Noisy interrogation   (expect low BER)
+%  Test 3 — Noise-only            (expect no frame_valid)
+%  Test 4 — Weak signal           (boundary, info only)
 
 FRAME_LEN = 6528;
 fs        = 12e6;
-ADC_SCALE = 30000;   % map normalized [0,1] → int16 range (keep headroom)
+ADC_SCALE = 30000;
 
-% Known interrogation frame
-interrog_hex = 'B01A2B05D2CE21DA000000';   % 22 hex = 88 bits
+interrog_hex = 'B01A2B05D2CE21DA000000';
 pass_count   = 0;
 fail_count   = 0;
 
 fprintf('========================================================\n');
-fprintf('   adsb_ip_top — Integer HDL Coder Test Bench\n');
+fprintf('   adsb_ip_top — Streaming HDL Test Bench\n');
 fprintf('========================================================\n\n');
 
-% Generate reference waveform (float)
 [tx_wave, tx_bits] = tb_adsb_modulate(interrog_hex, fs);
 
 % -----------------------------------------------------------------
-%  TEST 1 — Clean interrogation (no noise)
+%  TEST 1 — Clean interrogation
 % -----------------------------------------------------------------
 fprintf('--- Test 1: Clean interrogation ---\n');
 rx_float = tb_pad_frame(tx_wave, FRAME_LEN) * 0.5;
-[rx_re, rx_im] = tb_float_to_int16(rx_float, ADC_SCALE);
+[decoded, got_frame, got_valid] = tb_run_streaming(rx_float, ADC_SCALE, FRAME_LEN);
 
-[rx_bits, valid] = adsb_ip_top(rx_re, rx_im);
-
-if valid
-    rx_hex = tb_bits2hex(double(rx_bits));
-    ber    = sum(double(rx_bits) ~= tx_bits(1:88)) / 88;
-    fprintf('  Valid   : YES\n');
-    fprintf('  Decoded : %s\n', rx_hex);
-    fprintf('  Expected: %s\n', interrog_hex);
-    fprintf('  BER     : %.1f%%\n', ber*100);
+if got_frame && got_valid
+    rx_hex = tb_bits2hex(decoded);
+    n = min(length(decoded), 88);
+    ber = sum(decoded(1:n) ~= tx_bits(1:n)) / 88;
+    fprintf('  Frame    : YES (valid)\n');
+    fprintf('  Decoded  : %s\n', rx_hex);
+    fprintf('  Expected : %s\n', interrog_hex);
+    fprintf('  Bits     : %d\n', length(decoded));
+    fprintf('  BER      : %.1f%%\n', ber*100);
     if ber == 0
         fprintf('  >> PASS\n\n');
         pass_count = pass_count + 1;
@@ -50,8 +47,11 @@ if valid
         fprintf('  >> FAIL (BER > 0)\n\n');
         fail_count = fail_count + 1;
     end
+elseif got_frame && ~got_valid
+    fprintf('  Frame: YES but NOT valid (SNR fail) — FAIL\n\n');
+    fail_count = fail_count + 1;
 else
-    fprintf('  Valid: NO — FAIL (should have detected preamble)\n\n');
+    fprintf('  Frame: NO — FAIL (no frame_done pulse)\n\n');
     fail_count = fail_count + 1;
 end
 
@@ -62,16 +62,15 @@ fprintf('--- Test 2: Noisy interrogation (SNR ~20 dB) ---\n');
 rng(42);
 noise    = 0.005 * (randn(FRAME_LEN,1) + 1i*randn(FRAME_LEN,1));
 rx_float = tb_pad_frame(tx_wave, FRAME_LEN) * 0.4 + noise;
-[rx_re, rx_im] = tb_float_to_int16(rx_float, ADC_SCALE);
+[decoded, got_frame, got_valid] = tb_run_streaming(rx_float, ADC_SCALE, FRAME_LEN);
 
-[rx_bits, valid] = adsb_ip_top(rx_re, rx_im);
-
-if valid
-    rx_hex = tb_bits2hex(double(rx_bits));
-    ber    = sum(double(rx_bits) ~= tx_bits(1:88)) / 88;
-    fprintf('  Valid   : YES\n');
-    fprintf('  Decoded : %s\n', rx_hex);
-    fprintf('  BER     : %.1f%%\n', ber*100);
+if got_frame && got_valid
+    rx_hex = tb_bits2hex(decoded);
+    n = min(length(decoded), 88);
+    ber = sum(decoded(1:n) ~= tx_bits(1:n)) / 88;
+    fprintf('  Frame    : YES (valid)\n');
+    fprintf('  Decoded  : %s\n', rx_hex);
+    fprintf('  BER      : %.1f%%\n', ber*100);
     if ber < 0.05
         fprintf('  >> PASS (BER < 5%%)\n\n');
         pass_count = pass_count + 1;
@@ -80,21 +79,19 @@ if valid
         fail_count = fail_count + 1;
     end
 else
-    fprintf('  Valid: NO — FAIL\n\n');
+    fprintf('  Frame result: frame=%d valid=%d — FAIL\n\n', got_frame, got_valid);
     fail_count = fail_count + 1;
 end
 
 % -----------------------------------------------------------------
-%  TEST 3 — Noise-only (no signal)
+%  TEST 3 — Noise-only
 % -----------------------------------------------------------------
 fprintf('--- Test 3: Noise-only ---\n');
 rng(99);
 rx_noise = 0.01 * (randn(FRAME_LEN,1) + 1i*randn(FRAME_LEN,1));
-[rx_re, rx_im] = tb_float_to_int16(rx_noise, ADC_SCALE);
+[~, got_frame, got_valid] = tb_run_streaming(rx_noise, ADC_SCALE, FRAME_LEN);
 
-[~, valid] = adsb_ip_top(rx_re, rx_im);
-
-if ~valid
+if ~got_valid
     fprintf('  Valid: NO — PASS (correctly rejected noise)\n\n');
     pass_count = pass_count + 1;
 else
@@ -103,23 +100,22 @@ else
 end
 
 % -----------------------------------------------------------------
-%  TEST 4 — Weak signal (near threshold)
+%  TEST 4 — Weak signal
 % -----------------------------------------------------------------
 fprintf('--- Test 4: Weak signal (near threshold) ---\n');
 rng(7);
 noise    = 0.02 * (randn(FRAME_LEN,1) + 1i*randn(FRAME_LEN,1));
 rx_float = tb_pad_frame(tx_wave, FRAME_LEN) * 0.08 + noise;
-[rx_re, rx_im] = tb_float_to_int16(rx_float, ADC_SCALE);
+[decoded, got_frame, got_valid] = tb_run_streaming(rx_float, ADC_SCALE, FRAME_LEN);
 
-[rx_bits, valid] = adsb_ip_top(rx_re, rx_im);
-
-fprintf('  Valid: %s\n', tb_tf(valid));
-if valid
-    ber = sum(double(rx_bits) ~= tx_bits(1:88)) / 88;
-    fprintf('  BER  : %.1f%%\n', ber*100);
+fprintf('  Frame: %s,  Valid: %s\n', tb_tf(got_frame), tb_tf(got_valid));
+if got_valid && ~isempty(decoded)
+    n = min(length(decoded), 88);
+    ber = sum(decoded(1:n) ~= tx_bits(1:n)) / 88;
+    fprintf('  BER      : %.1f%%\n', ber*100);
 end
-fprintf('  >> INFO (boundary condition — either result acceptable)\n\n');
-pass_count = pass_count + 1;  % boundary: no hard pass/fail
+fprintf('  >> INFO (boundary condition)\n\n');
+pass_count = pass_count + 1;
 
 % -----------------------------------------------------------------
 %  SUMMARY
@@ -132,18 +128,40 @@ fprintf('========================================================\n');
 end
 
 % #####################################################################
+%  STREAMING RUNNER — feeds samples one at a time to the DUT
+% #####################################################################
+
+function [decoded_bits, got_frame, got_valid] = tb_run_streaming(rx_float, adc_scale, frame_len)
+% Simulate hardware clock: call adsb_ip_top once per sample
+    re_samples = int16(real(rx_float) * adc_scale);
+    im_samples = int16(imag(rx_float) * adc_scale);
+
+    decoded_bits = [];
+    got_frame = false;
+    got_valid = false;
+
+    % Clear persistent state by calling with a fresh MATLAB function context
+    clear adsb_ip_top;
+
+    for i = 1:frame_len
+        [bit_out, bit_valid, frame_done, frame_valid] = ...
+            adsb_ip_top(re_samples(i), im_samples(i), true);
+
+        if bit_valid
+            decoded_bits = [decoded_bits, double(bit_out)]; %#ok<AGROW>
+        end
+        if frame_done
+            got_frame = true;
+            got_valid = frame_valid;
+        end
+    end
+end
+
+% #####################################################################
 %  TEST BENCH HELPERS  (floating-point, not synthesized)
 % #####################################################################
 
-function [re_i16, im_i16] = tb_float_to_int16(cx_float, scale)
-% Convert complex double waveform to split int16 I/Q
-%   Mimics AD9361 ADC output: 12-bit values in 16-bit container
-    re_i16 = int16(real(cx_float) * scale);
-    im_i16 = int16(imag(cx_float) * scale);
-end
-
 function [waveform, bits] = tb_adsb_modulate(hexStr, fs)
-% ADS-B PPM modulation (same as prototype)
     bits = [];
     for i = 1:length(hexStr)
         bits = [bits, bitget(hex2dec(hexStr(i)), 4:-1:1)]; %#ok<AGROW>
