@@ -1,146 +1,219 @@
-%% ADS-B TX/ACK — ADALM Pluto SDR (Interrogator side)
+%% IFF GROUND STATION — ADALM Pluto SDR
 %
-% Each cycle:
-%   1. TX ADS-B waveform on 1090 MHz for TX_DURATION seconds
-%      (ZedBoard receives and decodes during this window)
-%   2. Stop TX, listen on 1030 MHz for ZedBoard's ACK
-%      (ZedBoard echoes the decoded message back on 1030 MHz)
-%   3. Decode ACK and report match — this is how you confirm the
-%      ZedBoard received correctly without needing its console.
+% Implements the ground-station (interrogator) side of IFF:
 %
-% Run this FIRST, then run test_adsb_zedboard.m.
-clear all; clc;
+%   1. TX interrogation on 1030 MHz  (challenge pulse sequence)
+%   2. Switch to RX on 1090 MHz      (listen for aircraft reply)
+%   3. Decode reply → extract aircraft ICAO address + squawk code
+%   4. Report: "Aircraft identified" or "No reply"
+%   5. Repeat every CYCLE_INTERVAL seconds
+%
+% Frequencies follow real-world IFF/SSR convention:
+%   1030 MHz = Interrogation  (ground → aircraft)
+%   1090 MHz = Reply          (aircraft → ground)
+%
+% Modulation: ADS-B PPM (pulse position modulation), 12 MSPS
+%
+% Run this FIRST.  Then run test_adsb_zedboard.m (aircraft transponder).
+clear all; close all; clc;
 
 % =====================================================================
 %  CONFIGURATION
 % =====================================================================
-ip_pluto      = 'ip:192.168.2.1';
-fc_tx         = 1090e6;   % Forward link: Pluto TX -> ZedBoard RX
-fc_rx         = 1030e6;   % Return  link: ZedBoard TX -> Pluto RX
-fs            = 12e6;     % 12 MSPS
-tx_gain       = -20;      % dB
-rx_gain       = 10;       % dB
+ip_pluto       = 'ip:192.168.2.1';
+fc_interrogate = 1030e6;   % Ground → Aircraft
+fc_reply       = 1090e6;   % Aircraft → Ground
+fs             = 12e6;     % 12 MSPS
+tx_gain        = -20;      % dB  (SMA cable)
+rx_gain        = 10;       % dB
 
-TX_DURATION   = 3.0;      % seconds to transmit (gives ZedBoard time to decode)
-RX_DURATION   = 5.0;      % seconds to listen for ACK
-
+TX_HOLD        = 3.0;      % seconds to hold interrogation TX
+RX_LISTEN      = 6.0;      % seconds to listen for reply
 MAX_CYCLES     = 5;
-CYCLE_INTERVAL = 5;       % seconds between cycles
+CYCLE_INTERVAL = 5;        % seconds between interrogations
 
-msg_hex = '8D4840D6202CC371C32CE0576098';
+% Interrogation message (ground station ID + mode request)
+% Format: [DF=11 (8 bits)][InterrogID 1A2B (16 bits)][ModeCode 05 (8 bits)]
+%         [Challenge nonce (32 bits)][Parity/CRC (24 bits)]  = 88 bits
+% Encoded as 22 hex chars.
+%
+% For this test we use a fixed interrogation so the transponder can
+% recognise it by the DF=11 header and reply with its identity.
+INTERROG_DF     = 'B0';          % Downlink Format 11 = All-call interrogation
+INTERROG_ID     = '1A2B';        % Ground station ID
+MODE_CODE       = '05';          % Mode 5 request
+CHALLENGE_HEX   = 'D2CE21DA';   % Random challenge nonce
 
 % =====================================================================
-%  BUILD TX WAVEFORM
+%  BUILD INTERROGATION WAVEFORM
 % =====================================================================
-[tx_wave, tx_bits] = adsb_modulate(msg_hex, fs);
+interrog_hex = [INTERROG_DF, INTERROG_ID, MODE_CODE, CHALLENGE_HEX];
+% Append CRC-24 placeholder (all-zero — transponder ignores for now)
+interrog_hex = [interrog_hex, '000000'];    % 22 hex = 88 bits total
 
-% ACK capture buffer: 4× one ADS-B frame length
-ack_frame_samples = round((20 + 8 + 112 + 20) * fs * 1e-6) * 4;
+[tx_wave, tx_bits] = adsb_modulate(interrog_hex, fs);
+
+% Reply capture buffer (aircraft reply = 112 bits = 28 hex ADS-B)
+reply_frame_samples = round((20 + 8 + 112 + 20) * fs * 1e-6) * 4;
 
 fprintf('========================================================\n');
-fprintf('   ADS-B TX/ACK — ADALM Pluto\n');
+fprintf('   IFF GROUND STATION — ADALM Pluto\n');
 fprintf('========================================================\n');
-fprintf('Pluto       : %s\n', ip_pluto);
-fprintf('TX Freq     : %.0f MHz (ADS-B forward)\n', fc_tx/1e6);
-fprintf('RX Freq     : %.0f MHz (ZedBoard ACK)\n', fc_rx/1e6);
+fprintf('Station     : %s   (ID: %s)\n', ip_pluto, INTERROG_ID);
+fprintf('Interrogate : %.0f MHz → TX\n', fc_interrogate/1e6);
+fprintf('Listen Reply: %.0f MHz → RX\n', fc_reply/1e6);
 fprintf('Fs          : %.0f MSPS\n', fs/1e6);
-fprintf('Message     : %s  (%d bits)\n', msg_hex, length(tx_bits));
-fprintf('TX window   : %.1f s   RX window: %.1f s\n', TX_DURATION, RX_DURATION);
+fprintf('Challenge   : %s\n', CHALLENGE_HEX);
+fprintf('TX hold     : %.1f s    RX listen: %.1f s\n', TX_HOLD, RX_LISTEN);
 fprintf('Cycles      : %d  |  Interval: %d s\n', MAX_CYCLES, CYCLE_INTERVAL);
 fprintf('========================================================\n\n');
 
 % =====================================================================
-%  MAIN CYCLE LOOP
+%  MAIN INTERROGATION LOOP
 % =====================================================================
-results = zeros(MAX_CYCLES, 3);  % [ack_found, bit_errors, ack_snr]
+fig = figure('Name','IFF Ground Station','Position',[100 100 900 620]);
+results = zeros(MAX_CYCLES, 4);  % [reply_found, bit_errors, snr, max_amp]
 
 for cycle = 1:MAX_CYCLES
-    fprintf('=== Cycle %d/%d  [%s] ===\n', cycle, MAX_CYCLES, datestr(now,'HH:MM:SS'));
+    fprintf('=== Interrogation %d/%d  [%s] ===\n', ...
+        cycle, MAX_CYCLES, datestr(now,'HH:MM:SS'));
+
+    reply_iq   = [];
+    reply_found = false;
+    rx_hex      = '';
+    snr_reply   = 0;
 
     % ------------------------------------------------------------------
-    %  STEP 1 — Transmit ADS-B on 1090 MHz
+    %  STEP 1 — TX interrogation on 1030 MHz
     % ------------------------------------------------------------------
-    fprintf('  [TX] Sending ADS-B on %.0f MHz for %.1f s ...\n', fc_tx/1e6, TX_DURATION);
+    fprintf('  [TX] Interrogation on %.0f MHz for %.1f s ...\n', ...
+        fc_interrogate/1e6, TX_HOLD);
     try
         ptx = sdrtx('Pluto', 'RadioID', ip_pluto, ...
-            'CenterFrequency', fc_tx, 'BasebandSampleRate', fs);
+            'CenterFrequency', fc_interrogate, 'BasebandSampleRate', fs);
         ptx.Gain = tx_gain;
         transmitRepeat(ptx, tx_wave);
-        pause(TX_DURATION);   % hold TX while ZedBoard decodes
+        pause(TX_HOLD);
         release(ptx);
-        fprintf('  [TX] Done.\n');
+        fprintf('  [TX] Interrogation sent.\n');
     catch ME
         fprintf('  [TX ERROR] %s\n', ME.message);
         try, release(ptx); catch, end
-        results(cycle,:) = [0, length(tx_bits), 0];
+        results(cycle,:) = [0, 0, 0, 0];
         if cycle < MAX_CYCLES, pause(CYCLE_INTERVAL); end
         continue;
     end
 
     % ------------------------------------------------------------------
-    %  STEP 2 — Listen for ZedBoard ACK on 1030 MHz
+    %  STEP 2 — Listen for aircraft reply on 1090 MHz
     % ------------------------------------------------------------------
-    fprintf('  [RX] Listening for ACK on %.0f MHz (%.1f s window) ...\n', ...
-        fc_rx/1e6, RX_DURATION);
-    ack_found  = false;
-    bit_errors = length(tx_bits);
-    snr_ack    = 0;
-
+    fprintf('  [RX] Listening for reply on %.0f MHz (%.1f s) ...\n', ...
+        fc_reply/1e6, RX_LISTEN);
     try
         prx = sdrrx('Pluto', 'RadioID', ip_pluto, ...
-            'CenterFrequency', fc_rx, 'BasebandSampleRate', fs, ...
-            'SamplesPerFrame', ack_frame_samples, ...
+            'CenterFrequency', fc_reply, 'BasebandSampleRate', fs, ...
+            'SamplesPerFrame', reply_frame_samples, ...
             'OutputDataType', 'double');
         prx.GainSource = 'Manual';
         prx.Gain = rx_gain;
 
-        pause(1.0);                      % settle
+        pause(1.0);    % settle
         t_deadline = tic;
-        while toc(t_deadline) < (RX_DURATION - 1.0)
-            ack_raw = prx();
+        while toc(t_deadline) < (RX_LISTEN - 1.0)
+            reply_iq = prx();
+            mx = max(abs(reply_iq));
+            if mx < 0.02, continue; end   % no signal yet
 
-            mx = max(abs(ack_raw));
-            if mx < 0.02
-                continue;               % nothing there yet
-            end
-
-            mag = adsb_preprocess(ack_raw, fs);
-            [data_start, corr_peak, snr_ratio] = adsb_framesync(mag, fs);
+            mag = adsb_preprocess(reply_iq, fs);
+            [data_start, ~, snr_ratio] = adsb_framesync(mag, fs);
 
             if snr_ratio >= 4
-                ack_bits  = adsb_decode_bits(mag, data_start, fs, 112);
-                ack_hex   = bits2hex(ack_bits);
-                snr_ack   = snr_ratio;
-                bit_errors = sum(ack_bits(1:length(tx_bits)) ~= tx_bits);
-                ack_found  = true;
-
-                fprintf('  [ACK] Received from ZedBoard:\n');
-                fprintf('        Sent    : %s\n', msg_hex);
-                fprintf('        Echo    : %s\n', ack_hex);
-                if bit_errors == 0
-                    fprintf('        MATCH — ZedBoard decode was PERFECT.\n');
-                else
-                    fprintf('        %d/%d bit errors in ACK echo.\n', ...
-                        bit_errors, length(tx_bits));
-                end
+                reply_bits = adsb_decode_bits(mag, data_start, fs, 112);
+                rx_hex     = bits2hex(reply_bits);
+                snr_reply  = snr_ratio;
+                reply_found = true;
                 break;
             end
         end
-
         release(prx);
-
-        if ~ack_found
-            fprintf('  [ACK] No ACK received — ZedBoard may not have decoded frame.\n');
-        end
     catch ME
         fprintf('  [RX ERROR] %s\n', ME.message);
         try, release(prx); catch, end
     end
 
-    results(cycle,:) = [ack_found, bit_errors, snr_ack];
+    % ------------------------------------------------------------------
+    %  STEP 3 — Identify the aircraft from the reply
+    % ------------------------------------------------------------------
+    if reply_found
+        % ADS-B reply format: DF(8) + ICAO(24) + ME(56) + PI(24) = 112 bits
+        %   ICAO address is bits 9-32 (hex chars 3-8)
+        %   Squawk/IFF code is in ME field chars 9-22
+        icao_hex      = rx_hex(3:8);
+        iff_data      = rx_hex(9:22);
+
+        fprintf('  ┌──────────────────────────────────────────┐\n');
+        fprintf('  │  AIRCRAFT REPLY RECEIVED                 │\n');
+        fprintf('  │  Full frame : %s  │\n', rx_hex);
+        fprintf('  │  ICAO addr  : %s                         │\n', icao_hex);
+        fprintf('  │  IFF data   : %s              │\n', iff_data);
+        fprintf('  │  SNR ratio  : %.1f                        │\n', snr_reply);
+        fprintf('  │  STATUS     : AIRCRAFT IDENTIFIED         │\n');
+        fprintf('  └──────────────────────────────────────────┘\n');
+        results(cycle,:) = [1, 0, snr_reply, mx];
+    else
+        fprintf('  ┌──────────────────────────────────────────┐\n');
+        fprintf('  │  NO REPLY — Aircraft not responding       │\n');
+        fprintf('  └──────────────────────────────────────────┘\n');
+        results(cycle,:) = [0, 0, 0, 0];
+    end
+
+    % ------------------------------------------------------------------
+    %  Live plot
+    % ------------------------------------------------------------------
+    if ishandle(fig)
+        figure(fig);
+        subplot(3,2,1); plot(real(tx_wave));
+        title('Interrogation Waveform (TX)');
+        xlabel('Sample'); ylabel('I'); grid on;
+
+        subplot(3,2,2);
+        if ~isempty(reply_iq), plot(real(reply_iq)); end
+        title(sprintf('Reply RX — Cycle %d', cycle));
+        xlabel('Sample'); ylabel('I'); grid on;
+
+        subplot(3,2,3);
+        if ~isempty(reply_iq)
+            N = length(reply_iq); f = (-N/2:N/2-1)*(fs/N);
+            plot(f/1e6, 20*log10(abs(fftshift(fft(reply_iq)))+eps));
+            xlabel('MHz'); ylabel('dB'); grid on;
+        end
+        title('Reply Spectrum');
+
+        subplot(3,2,4);
+        if reply_found
+            stem(reply_bits(1:min(56,end)),'filled','MarkerSize',3);
+            title(sprintf('Reply bits — ICAO %s', icao_hex));
+        end
+        ylim([-0.2 1.2]); grid on;
+
+        subplot(3,2,[5 6]); cla; axis off;
+        if reply_found
+            set(gca,'Color',[0.2 0.8 0.2]);
+            text(0.5, 0.5, sprintf('Cycle %d — AIRCRAFT %s IDENTIFIED\nIFF: %s   SNR: %.0f', ...
+                cycle, icao_hex, iff_data, snr_reply), ...
+                'FontSize', 14, 'FontWeight', 'bold', ...
+                'HorizontalAlignment','center','VerticalAlignment','middle');
+        else
+            set(gca,'Color',[0.8 0.2 0.2]);
+            text(0.5, 0.5, sprintf('Cycle %d — NO REPLY', cycle), ...
+                'FontSize', 14, 'FontWeight', 'bold', ...
+                'HorizontalAlignment','center','VerticalAlignment','middle');
+        end
+        drawnow;
+    end
 
     if cycle < MAX_CYCLES
-        fprintf('  Next cycle in %d s ...\n\n', CYCLE_INTERVAL);
+        fprintf('  Next interrogation in %d s ...\n\n', CYCLE_INTERVAL);
         pause(CYCLE_INTERVAL);
     end
 end
@@ -148,36 +221,31 @@ end
 % =====================================================================
 %  SUMMARY
 % =====================================================================
-n_ack   = sum(results(:,1));
-n_match = sum(results(:,1) & results(:,2)==0);
+n_replies = sum(results(:,1));
 fprintf('\n========================================================\n');
-fprintf('                    SUMMARY\n');
+fprintf('         GROUND STATION INTERROGATION SUMMARY\n');
 fprintf('========================================================\n');
-fprintf('ACK received   : %d/%d cycles\n', n_ack, MAX_CYCLES);
-fprintf('Perfect match  : %d/%d cycles\n', n_match, MAX_CYCLES);
-if n_match == MAX_CYCLES
-    fprintf('ALL CYCLES PERFECT — RF link confirmed bidirectional.\n');
-elseif n_ack > 0
-    fprintf('Partial success — check ZedBoard RX gain.\n');
+fprintf('Interrogations sent : %d\n', MAX_CYCLES);
+fprintf('Replies received    : %d/%d\n', n_replies, MAX_CYCLES);
+if n_replies == MAX_CYCLES
+    fprintf('ALL INTERROGATIONS ANSWERED — Aircraft identification confirmed.\n');
+elseif n_replies > 0
+    fprintf('Partial replies — intermittent link.\n');
 else
-    fprintf('No ACK — check ZedBoard is running and cable connected.\n');
+    fprintf('No replies — check transponder is running.\n');
 end
 fprintf('========================================================\n');
 
 % =====================================================================
-%  ADS-B MODULATOR  (Hex string -> complex PPM I/Q waveform)
+%  ADS-B PPM MODULATOR
 % =====================================================================
 function [waveform, bits] = adsb_modulate(hexStr, fs)
-    % Convert hex string to bits
     bits = [];
     for i = 1:length(hexStr)
         val  = hex2dec(hexStr(i));
         bits = [bits, bitget(val, 4:-1:1)];
     end
-
-    sps = round(fs * 1e-6);       % samples per microsecond (12 at 12 MSPS)
-
-    % Preamble (8 µs): pulses at 0, 1, 3.5, 4.5 µs (each 0.5 µs wide)
+    sps          = round(fs * 1e-6);
     preamble_len = round(8 * sps);
     preamble     = zeros(1, preamble_len);
     pulse_len    = round(0.5 * sps);
@@ -186,42 +254,27 @@ function [waveform, bits] = adsb_modulate(hexStr, fs)
         t1 = min(t0 + pulse_len - 1, preamble_len);
         preamble(t0:t1) = 1;
     end
-
-    % Data: PPM encoding (1 µs per bit)
-    %   bit=1 -> pulse in first  half-bit (0-0.5 µs up, 0.5-1 µs down)
-    %   bit=0 -> pulse in second half-bit (0-0.5 µs down, 0.5-1 µs up)
     data = [];
     for b = bits
-        pat = zeros(1, sps);
-        mid = floor(sps / 2);
-        if b == 1
-            pat(1:mid) = 1;
-        else
-            pat(mid+1:end) = 1;
-        end
+        pat = zeros(1, sps); mid = floor(sps/2);
+        if b == 1, pat(1:mid) = 1; else, pat(mid+1:end) = 1; end
         data = [data, pat];
     end
-
-    % Guard silence before/after frame (20 µs each side)
     guard = zeros(1, sps * 20);
     sig   = double([guard, preamble, data, guard]);
-
-    % Normalize and force complex (PlutoSDR rejects real waveforms)
-    sig      = sig / max(abs(sig)) * 0.9;
+    sig   = sig / max(abs(sig)) * 0.9;
     waveform = sig.' + 1i * 1e-12 * ones(length(sig), 1);
 end
 
 % =====================================================================
-%  SHARED DSP FUNCTIONS  (same as test_adsb_zedboard.m — IP core targets)
+%  SHARED DSP  (same 3 IP-core functions as ZedBoard)
 % =====================================================================
-
 function mag = adsb_preprocess(rx_iq, fs)
-    sps    = round(fs / 1e6);
-    mag    = abs(rx_iq(:));
-    dc_win = round(20 * sps);
-    mag    = mag - movmean(mag, dc_win);
-    mag    = max(mag, 0);
-    mag    = mag / (max(mag) + eps);
+    sps = round(fs / 1e6);
+    mag = abs(rx_iq(:));
+    mag = mag - movmean(mag, round(20 * sps));
+    mag = max(mag, 0);
+    mag = mag / (max(mag) + eps);
 end
 
 function [data_start, corr_peak, snr_ratio] = adsb_framesync(mag, fs)
@@ -237,8 +290,7 @@ function [data_start, corr_peak, snr_ratio] = adsb_framesync(mag, fs)
     [c, lags]           = xcorr(mag, kernel);
     [corr_peak, pk_idx] = max(c);
     snr_ratio           = corr_peak / (median(abs(c)) + eps);
-    start_idx           = lags(pk_idx) + 1;
-    data_start          = start_idx + kern_len;
+    data_start          = lags(pk_idx) + 1 + kern_len;
     if data_start < 1, data_start = 1; end
 end
 
@@ -250,8 +302,8 @@ function bits = adsb_decode_bits(mag, data_start, fs, n_bits)
         i0 = data_start + k * sps;
         i1 = i0 + sps - 1;
         if i1 > length(mag), break; end
-        chunk      = mag(i0:i1);
-        bits(k+1)  = double(sum(chunk(1:half)) > sum(chunk(half+1:end)));
+        chunk     = mag(i0:i1);
+        bits(k+1) = double(sum(chunk(1:half)) > sum(chunk(half+1:end)));
     end
 end
 
