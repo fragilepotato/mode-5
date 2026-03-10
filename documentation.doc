@@ -1,0 +1,100 @@
+Technical Report: Mode 5 IFF / ADS-B Link Debugging
+Hardware: Pluto SDR (TX) ↔ SMA cable ↔ ZedBoard FMCOMMS3 AD9361 (RX)
+Software: MATLAB Communications Toolbox SDR, demo_comm.m → test_adsb_link.m
+
+Executive Summary
+demo_comm.m failed due to five independent bugs that compounded each other. None was hardware-related — the SMA cable and both radios functioned correctly throughout. The problems were entirely in the signal generation, filtering, and decoding software. test_adsb_link.m was created to isolate and fix each bug on the simpler ADS-B foundation before layering Mode 5 crypto back on top.
+
+Bug 1 — PlutoSDR Rejected Real-Valued Waveform
+Symptom:
+
+Root Cause:
+The TX waveform was built as:
+
+MATLAB's isreal() returns true for both of these when the imaginary part is identically zero — it optimises the storage back to a real array internally. The Pluto driver checks isreal() and throws before transmitting.
+
+Fix:
+
+A 1e-12 imaginary component is 100 dB below the signal and completely inaudible to the DAC, but it prevents MATLAB from collapsing the type.
+
+Bug 2 — Sample Rate Too Low for ADS-B Pulse Timing (Critical)
+Symptom: After fixing the complex issue, the demodulator produced random bits (BER ~50%) regardless of signal strength. The calibration probe showed max=0.003 (noise floor) at 4 MSPS despite identical gain settings that produced max=0.31 at 12 MSPS.
+
+Root Cause:ADS-B uses PPM (Pulse Position Modulation) with a fundamental pulse width of 0.5 µs. At 4 MSPS:
+
+Parameter	4 MSPS	12 MSPS
+Samples per µs	4	12
+Samples per 0.5 µs pulse	2	6
+Samples per bit period (1 µs)	4	12
+Preamble kernel length	32 samples	96 samples
+With only 2 samples per pulse:
+
+The preamble correlation kernel had only 4 active samples out of 32 total → extremely poor SNR in the correlator output
+Any filter (highpass, moving average) operates over window lengths that span multiple pulses at once, destroying the pulse structure
+The transmitRepeat buffer at 4 MSPS repeated the packet so fast that the RX frame would capture many overlapping repetitions with random phase alignment
+Fix: Changed fs = 4e6 → fs = 12e6 (the ITU standard for ADS-B receivers). This gives 6 samples per half-pulse, making the waveform recoverable by correlation.
+
+Bug 3 — Wrong DC Removal Destroyed PPM Bit Energy (Critical)
+Symptom: With gains correct and 12 MSPS, BER was still ~39-47%. RECEIVED was always 0000...0000 — every 1 bit decoded as 0. Exactly 44 errors = exactly the number of 1 bits in the test message.
+
+Root Cause:
+The decoder pipeline was:
+
+highpass() applied to the magnitude envelope acts as an edge detector (it outputs the derivative of the envelope). For a PPM 1 bit (pulse in the first half = [HIGH HIGH LOW LOW]), the edge detector produces:
+
+Now both halves have equal spike energy → tie → decisions become noise-driven → systematic 50% BER. For the specific test message 8D4840D6... with 44 ones, all 44 ones decoded as zeros → exactly what was observed.
+
+The fix required filtering the complex IQ signal before envelope detection, which removes the AD9361's DC ramp at the source without touching pulse shape:
+
+Option B (moving average) was chosen because highpass() still introduces transient ringing on the 6-sample-wide pulses at 12 MSPS. The 20 µs moving window is 240 samples — wide enough to track the slow AD9361 startup ramp but narrow enough to leave individual 6-sample pulses untouched.
+
+Bug 4 — Gain Range Was Wrong on Both Ends
+Symptom — Too Low: max=0.003, BER=50%. The correlator found noise spikes instead of the preamble, producing random data_start values.
+
+Symptom — Too High: max=1.4142 = √2. This is the exact ADC saturation value for a normalized complex signal (|I + jQ|_max = √(1² + 1²) = √2). The signal was clipped to a square wave, destroying all modulation.
+
+Root Cause: SMA cable has ~0 dB path loss. The initial gains (-50 dB TX, 0 dB RX) came from antenna-link assumptions — an antenna link has 60–80+ dB of propagation loss, so those settings were effectively applying -50 dB to a signal that needed +0 dB attenuation. The +20 dB overcorrection (to TX -10 dB, RX +30 dB) pushed 40 dB too far in the other direction, saturating the AD9361 front-end.
+
+Fix: Auto-calibration sweep that measures max(abs(rx)) directly and picks the gain combo that lands the signal in the linear range (0.05–1.0), settling on TX=-20 dB, RX=+10 dB giving max=0.31.
+
+Target amplitude guideline for SMA cable:
+
+max(abs(rx))	Diagnosis
+< 0.01	Signal absent / gain far too low
+0.01–0.05	Below noise floor — increase RX gain
+0.05–0.80	Good linear range
+0.80–1.00	Marginal — reduce TX or RX
+≥ 1.00	ADC clipping — reduce immediately
+= 1.414	Full saturation — both I and Q rails clipped
+Bug 5 — Missing cal_data = zrx() Assignment (Typo)
+Symptom:
+
+Root Cause: During a refactor of the calibration loop, the line cal_data = zrx(); was deleted while editing the for f = 1:3, zrx(); end flush block above it. The radios were connecting, flushing, and releasing, but the actual calibration capture was never saved. best_max_amp stayed at 0 for all gain settings, triggering the No signal detected error before the test even started.
+
+Fix: Restore the single missing line between the flush loop and release().
+
+Why demo_comm.m Mode 5 DSSS Further Complicated Things
+On top of the five bugs above, demo_comm.m added a DSSS (Direct Sequence Spread Spectrum) layer with a length-31 Gold code. At 4 MSPS this meant:
+
+Each chip was round(4e6/1e6) = 4 samples wide — marginally workable
+But the DSSS preamble was 2 × 31 × 4 = 248 samples long
+The frame size length(tx_interrog) * 3 was only ~3× the waveform, so when data_start was computed incorrectly (due to the same off-by-one and DC bugs), the payload extraction window fell outside the buffer
+The crypto validation (sync + CRC-16 + MAC) then rejected the garbled bits — correctly — but the error message "Interrogation FAILED validation" gave no indication that the actual problem was 6 layers deeper in the signal chain.
+
+What test_adsb_link.m Does Differently
+Aspect	demo_comm.m	test_adsb_link.m
+Modulation	BPSK + DSSS (Gold-31)	Plain PPM (ADS-B standard)
+Sample rate	4 MSPS	12 MSPS
+DC removal	highpass(abs(IQ))	movmean on envelope
+Gains	Fixed (wrong for cable)	Auto-calibration sweep
+Validation	Crypto MAC + CRC	Direct bit comparison
+Debug output	Pass/fail only	Amplitude stats, SNR, BER, bit-level diff
+Complex TX	complex(x, zeros) (failed)	x + 1i*1e-12 (works)
+Path Forward to Mode 5
+Once test_adsb_link.m consistently shows BER = 0%, the correct sequence to re-introduce Mode 5 is:
+
+Keep 12 MSPS and the movmean decoder — carry these directly into demo_comm.m
+Replace PPM with BPSK — simpler to decode at wider bandwidth, better noise immunity
+Remove DSSS initially — add it back only after plain BPSK works cleanly
+Add CRC-16 alone first — verify framing before adding the MAC layer
+Add MAC last — once CRC passes consistently, the crypto will be the only remaining variable
