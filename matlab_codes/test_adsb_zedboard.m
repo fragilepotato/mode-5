@@ -1,6 +1,352 @@
-%% ADS-B RX — ZedBoard FMCOMMS3 / AD9361
+%% ADS-B RX/ACK — ZedBoard FMCOMMS3 / AD9361  (Autonomous Transponder)
 %
-% Receives and decodes ADS-B PPM waveform from Pluto on 1090 MHz.
+% This script runs autonomously on ZedBoard (no PC console needed).
+% Confirmation that it received the signal: it TRANSMITS AN ACK REPLY
+% back to Pluto on 1030 MHz, echoing the decoded message.
+% Pluto script (test_adsb_pluto.m) receives and validates the echo.
+%
+% Cycle behaviour:
+%   1. Listen on 1090 MHz for ADS-B frame from Pluto
+%   2. Decode using three IP-core-candidate functions
+%   3. If valid: TX ACK on 1030 MHz  (echo of decoded message)
+%   4. Repeat MAX_CYCLES times
+%
+% For fully embedded operation (no MATLAB console):
+%   - Set MAX_CYCLES = Inf for indefinite operation
+%   - Pluto's rx will confirm each received ADS-B frame via the echo
+%   - Serial UART output (fprintf) is visible on ZedBoard terminal
+%     via /dev/ttyPS0 at 115200 baud if run standalone
+%
+% The three IP core candidate functions at the bottom of this file
+% (adsb_preprocess, adsb_framesync, adsb_decode_bits) are kept
+% self-contained with fixed array I/O, ready for MATLAB HDL Coder
+% targeting Vivado 2023.2.
+clear all; close all; clc;
+
+% =====================================================================
+%  CONFIGURATION
+% =====================================================================
+ip_zed        = '192.168.1.10';
+fc_rx         = 1090e6;    % Receive ADS-B from Pluto on 1090 MHz
+fc_tx         = 1030e6;    % Transmit ACK back to Pluto on 1030 MHz
+fs            = 12e6;      % 12 MSPS
+rx_gain       = 25;        % dB  — increase if signal too weak
+tx_gain       = -20;       % dB  — Pluto RX is -20 dB TX, SMA cable
+
+ACK_DURATION  = 4.0;       % seconds to hold ACK TX on air
+                           % (must overlap Pluto's RX window in pluto script)
+MAX_CYCLES    = 5;         % set to Inf for continuous autonomous operation
+CYCLE_INTERVAL = 1.0;      % seconds between RX attempts
+
+% Frame capture buffer: 4× one ADS-B frame
+frame_samples = round((20 + 8 + 112 + 20) * fs * 1e-6) * 4;
+
+% Reference message (for BER reporting — not needed for autonomous op)
+ref_hex  = '8D4840D6202CC371C32CE0576098';
+ref_bits = hex2bits(ref_hex);
+
+fprintf('========================================================\n');
+fprintf('   ADS-B RX/ACK — ZedBoard FMCOMMS3  (Autonomous)\n');
+fprintf('========================================================\n');
+fprintf('ZedBoard    : %s\n', ip_zed);
+fprintf('RX Freq     : %.0f MHz  (listen for Pluto)\n', fc_rx/1e6);
+fprintf('TX Freq     : %.0f MHz  (ACK reply to Pluto)\n', fc_tx/1e6);
+fprintf('Fs          : %.0f MSPS\n', fs/1e6);
+fprintf('RX Gain     : %d dB   TX Gain: %d dB\n', rx_gain, tx_gain);
+fprintf('ACK window  : %.1f s\n', ACK_DURATION);
+fprintf('Cycles      : %d\n', MAX_CYCLES);
+fprintf('========================================================\n');
+fprintf('ACK on 1030 MHz = confirmation Pluto transmission received.\n\n');
+
+% =====================================================================
+%  MAIN AUTONOMOUS LOOP
+% =====================================================================
+fig      = figure('Name','ADS-B ZedBoard RX/ACK','Position',[100 100 900 620]);
+cycle    = 0;
+n_found  = 0;
+n_match  = 0;
+
+while ishandle(fig) && cycle < MAX_CYCLES
+    cycle = cycle + 1;
+    fprintf('=== Cycle %d/%d  [%s] ===\n', cycle, MAX_CYCLES, datestr(now,'HH:MM:SS'));
+
+    decoded_hex = '';
+    rx_iq       = [];
+    found       = false;
+    bit_errors  = length(ref_bits);
+
+    % ------------------------------------------------------------------
+    %  STEP 1 — Capture on 1090 MHz
+    % ------------------------------------------------------------------
+    try
+        zrx = sdrrx('AD936x', 'IPAddress', ip_zed, ...
+            'CenterFrequency', fc_rx, 'BasebandSampleRate', fs, ...
+            'SamplesPerFrame', frame_samples, ...
+            'OutputDataType', 'double', 'ChannelMapping', 1);
+        zrx.GainSource = 'Manual';
+        zrx.Gain       = rx_gain;
+
+        pause(1.0);                     % settle
+        for k = 1:3, zrx(); end         % flush stale buffer
+        rx_iq = zrx();
+        release(zrx);
+
+        mx = max(abs(rx_iq));
+        fprintf('  [RX] max=%.4f  mean=%.4f\n', mx, mean(abs(rx_iq)));
+
+        if mx > 1.2
+            fprintf('  WARNING: ADC clipping — reduce rx_gain.\n');
+        elseif mx < 0.02
+            fprintf('  WARNING: Signal too weak — increase rx_gain or check cable.\n');
+        end
+    catch ME
+        fprintf('  [RX ERROR] %s\n', ME.message);
+        try, release(zrx); catch, end
+        pause(CYCLE_INTERVAL);
+        continue;
+    end
+
+    % ------------------------------------------------------------------
+    %  STEP 2 — Decode  (IP core candidate pipeline)
+    % ------------------------------------------------------------------
+    mag = adsb_preprocess(rx_iq, fs);
+    [data_start, corr_peak, snr_ratio] = adsb_framesync(mag, fs);
+    fprintf('  [SYNC] corr_peak=%.3f  SNR_ratio=%.1f  data_start=%d\n', ...
+        corr_peak, snr_ratio, data_start);
+
+    if snr_ratio >= 4
+        rx_bits     = adsb_decode_bits(mag, data_start, fs, 112);
+        decoded_hex = bits2hex(rx_bits);
+        found       = true;
+        n_found     = n_found + 1;
+
+        % Compare against reference
+        bit_errors = sum(rx_bits(1:length(ref_bits)) ~= ref_bits);
+        if bit_errors == 0
+            n_match = n_match + 1;
+            fprintf('  [DECODE] PERFECT: %s\n', decoded_hex);
+        else
+            fprintf('  [DECODE] %d errors: %s\n', bit_errors, decoded_hex);
+        end
+    else
+        fprintf('  [DECODE] No valid frame (SNR ratio %.1f < 4)\n', snr_ratio);
+    end
+
+    % ------------------------------------------------------------------
+    %  STEP 3 — Transmit ACK on 1030 MHz   ← THIS is the autonomous feedback
+    %
+    %  Even without a connected PC, Pluto will detect this ACK and report
+    %  whether ZedBoard decoded correctly. The RF ACK is the sole
+    %  confirmation mechanism for autonomous/embedded operation.
+    % ------------------------------------------------------------------
+    if found
+        fprintf('  [ACK TX] Sending echo on %.0f MHz for %.1f s ...\n', ...
+            fc_tx/1e6, ACK_DURATION);
+        try
+            ack_wave = adsb_modulate(decoded_hex, fs);
+
+            ztx = sdrtx('AD936x', 'IPAddress', ip_zed, ...
+                'CenterFrequency', fc_tx, 'BasebandSampleRate', fs, ...
+                'ChannelMapping', 1);
+            ztx.Gain = tx_gain;
+
+            transmitRepeat(ztx, ack_wave);
+            pause(ACK_DURATION);    % hold TX so Pluto has time to capture
+            release(ztx);
+            fprintf('  [ACK TX] Done.\n');
+        catch ME
+            fprintf('  [ACK TX ERROR] %s\n', ME.message);
+            try, release(ztx); catch, end
+        end
+    else
+        fprintf('  [ACK TX] Skipped — no valid decode.\n');
+    end
+
+    % ------------------------------------------------------------------
+    %  Live plot
+    % ------------------------------------------------------------------
+    if ishandle(fig) && ~isempty(rx_iq)
+        figure(fig);
+        subplot(3,2,1); plot(real(rx_iq));
+        title(sprintf('RX I — Cycle %d', cycle));
+        xlabel('Sample'); ylabel('I'); grid on;
+
+        subplot(3,2,2); plot(mag);
+        title('Envelope after DC removal'); xlabel('Sample'); grid on;
+        if found && data_start > 0
+            hold on; xline(data_start,'r--','Data start'); hold off;
+        end
+
+        subplot(3,2,3);
+        N = length(rx_iq); f = (-N/2:N/2-1)*(fs/N);
+        plot(f/1e6, 20*log10(abs(fftshift(fft(rx_iq)))+eps));
+        title('Spectrum'); xlabel('MHz'); ylabel('dB'); grid on;
+
+        subplot(3,2,4);
+        if found
+            stem(rx_bits(1:min(56,end)),'filled','MarkerSize',3); hold on;
+            stem(ref_bits(1:min(56,end)),'r.','MarkerSize',6); hold off;
+            legend('RX','REF','Location','best');
+        end
+        title('First 56 bits  (RX=blue, REF=red)'); ylim([-0.2 1.2]); grid on;
+
+        subplot(3,2,[5 6]); cla; axis off;
+        if found && bit_errors == 0
+            bg = [0.2 0.8 0.2]; msg = sprintf('Cycle %d — DECODED & ACK SENT\n%s', cycle, decoded_hex);
+        elseif found
+            bg = [0.9 0.6 0.1]; msg = sprintf('Cycle %d — ACK SENT (%d bit errors)\n%s', cycle, bit_errors, decoded_hex);
+        else
+            bg = [0.8 0.2 0.2]; msg = sprintf('Cycle %d — NO FRAME DETECTED', cycle);
+        end
+        set(gca,'Color',bg);
+        text(0.5,0.5,msg,'FontSize',13,'FontWeight','bold', ...
+            'HorizontalAlignment','center','VerticalAlignment','middle');
+        drawnow;
+    end
+
+    if cycle < MAX_CYCLES && CYCLE_INTERVAL > 0
+        pause(CYCLE_INTERVAL);
+    end
+end
+
+% =====================================================================
+%  SUMMARY
+% =====================================================================
+fprintf('\n========================================================\n');
+fprintf('                     SUMMARY\n');
+fprintf('========================================================\n');
+fprintf('Cycles run     : %d\n', cycle);
+fprintf('Frames decoded : %d/%d\n', n_found, cycle);
+fprintf('Perfect decode : %d/%d\n', n_match, cycle);
+fprintf('ACK replies TX : %d (on %.0f MHz)\n', n_found, fc_tx/1e6);
+if n_match == cycle
+    fprintf('ALL PERFECT — ZedBoard decode chain is solid.\n');
+elseif n_found > 0
+    fprintf('Partial — check rx_gain or SNR.\n');
+else
+    fprintf('No frames found — check Pluto is transmitting.\n');
+end
+fprintf('========================================================\n');
+
+% =====================================================================
+%  IP CORE CANDIDATE — Stage 1: Envelope + DC removal
+%
+%  IN : rx_iq  — complex I/Q samples (double)
+%       fs     — sample rate (Hz)
+%  OUT: mag    — normalised real envelope  [0..1]
+%
+%  HDL: movmean → sliding-window accumulator (shift register + adder tree)
+%       max-normalization → one max-tracker + multiplier
+% =====================================================================
+function mag = adsb_preprocess(rx_iq, fs)
+    sps    = round(fs / 1e6);
+    mag    = abs(rx_iq(:));
+    dc_win = round(20 * sps);       % 20 µs window = 240 samples at 12 MSPS
+    mag    = mag - movmean(mag, dc_win);
+    mag    = max(mag, 0);
+    mag    = mag / (max(mag) + eps);
+end
+
+% =====================================================================
+%  IP CORE CANDIDATE — Stage 2: Preamble matched filter / frame sync
+%
+%  IN : mag        — from adsb_preprocess
+%       fs         — sample rate (Hz)
+%  OUT: data_start — 1-based index where PPM data bits begin
+%       corr_peak  — matched filter peak value
+%       snr_ratio  — peak/median (threshold = 4 for valid frame)
+%
+%  HDL: xcorr with fixed 96-tap kernel → FIR with ROM coefficients
+%       (kernel is compile-time constant — no runtime multiplications)
+% =====================================================================
+function [data_start, corr_peak, snr_ratio] = adsb_framesync(mag, fs)
+    sps      = round(fs / 1e6);
+    pulse_w  = round(0.5 * sps);
+    kern_len = round(8 * sps);
+    kernel   = -ones(kern_len, 1);
+    for t_us = [0, 1, 3.5, 4.5]
+        t0 = round(t_us * sps) + 1;
+        t1 = min(t0 + pulse_w - 1, kern_len);
+        kernel(t0:t1) = 1;
+    end
+    [c, lags]           = xcorr(mag, kernel);
+    [corr_peak, pk_idx] = max(c);
+    snr_ratio           = corr_peak / (median(abs(c)) + eps);
+    start_idx           = lags(pk_idx) + 1;
+    data_start          = start_idx + kern_len;
+    if data_start < 1, data_start = 1; end
+end
+
+% =====================================================================
+%  IP CORE CANDIDATE — Stage 3: PPM bit decisions
+%
+%  IN : mag        — from adsb_preprocess
+%       data_start — from adsb_framesync
+%       fs         — sample rate (Hz)
+%       n_bits     — number of bits to decode (112 for ADS-B)
+%  OUT: bits       — decoded bit vector (uint1)
+%
+%  HDL: per-symbol half-period accumulate-and-compare
+%       No division required — pure adder + comparator per symbol
+% =====================================================================
+function bits = adsb_decode_bits(mag, data_start, fs, n_bits)
+    sps  = round(fs / 1e6);
+    half = floor(sps / 2);
+    bits = zeros(1, n_bits);
+    for k = 0:n_bits-1
+        i0 = data_start + k * sps;
+        i1 = i0 + sps - 1;
+        if i1 > length(mag), break; end
+        chunk     = mag(i0:i1);
+        bits(k+1) = double(sum(chunk(1:half)) > sum(chunk(half+1:end)));
+    end
+end
+
+% =====================================================================
+%  HELPERS
+% =====================================================================
+function [waveform, bits] = adsb_modulate(hexStr, fs)
+    bits = [];
+    for i = 1:length(hexStr)
+        val  = hex2dec(hexStr(i));
+        bits = [bits, bitget(val, 4:-1:1)];
+    end
+    sps          = round(fs * 1e-6);
+    preamble_len = round(8 * sps);
+    preamble     = zeros(1, preamble_len);
+    pulse_len    = round(0.5 * sps);
+    for t_us = [0, 1, 3.5, 4.5]
+        t0 = round(t_us * sps) + 1;
+        t1 = min(t0 + pulse_len - 1, preamble_len);
+        preamble(t0:t1) = 1;
+    end
+    data = [];
+    for b = bits
+        pat = zeros(1, sps); mid = floor(sps/2);
+        if b == 1, pat(1:mid) = 1; else, pat(mid+1:end) = 1; end
+        data = [data, pat];
+    end
+    guard    = zeros(1, sps * 20);
+    sig      = double([guard, preamble, data, guard]);
+    sig      = sig / max(abs(sig)) * 0.9;
+    waveform = sig.' + 1i * 1e-12 * ones(length(sig), 1);
+end
+
+function bits = hex2bits(hexStr)
+    bits = [];
+    for i = 1:length(hexStr)
+        bits = [bits, bitget(hex2dec(hexStr(i)), 4:-1:1)];
+    end
+end
+
+function h = bits2hex(bits)
+    chars = '0123456789ABCDEF';
+    h = '';
+    for i = 1:4:length(bits)-3
+        v = bits(i)*8 + bits(i+1)*4 + bits(i+2)*2 + bits(i+3);
+        h = [h, chars(v+1)];
+    end
+end
 %
 % Signal processing is factored into three standalone functions:
 %   adsb_preprocess()  — DC removal, envelope normalisation
