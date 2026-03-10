@@ -98,3 +98,184 @@ Replace PPM with BPSK — simpler to decode at wider bandwidth, better noise imm
 Remove DSSS initially — add it back only after plain BPSK works cleanly
 Add CRC-16 alone first — verify framing before adding the MAC layer
 Add MAC last — once CRC passes consistently, the crypto will be the only remaining variable
+
+================================================================================
+PART 2 — PROJECT EVOLUTION LOG (March 2026)
+================================================================================
+
+Phase 1: Initial Setup & Upload
+────────────────────────────────
+- Created GitHub repository: https://github.com/fragilepotato/mode-5 (master branch)
+- Uploaded initial MATLAB files:
+    • demo_comm.m         — Mode 5 IFF challenge-response system
+    • reset_zedboard_ip.m — ZedBoard IP configuration via serial (COM8, 115200 baud)
+    • slow_simulation_IFF.m — ZedBoard-only loopback test
+    • test5.m             — Early test script
+
+Phase 2: Mode 5 IFF Implementation (demo_comm.m v1)
+────────────────────────────────────────────────────
+- Rewrote demo_comm.m with full Mode 5 IFF features:
+    • BPSK + DSSS modulation (Gold code, length-31 PN sequence)
+    • HMAC-style MAC with pre-shared 16-byte key
+    • CRC-16 validation
+    • Two-phase protocol: 1030 MHz interrogation, 1090 MHz reply
+    • 5-cycle continuous operation at 5-second intervals
+    • Live monitor figure with I/Q, spectrum, and status display
+- Result: FAILED — 5 compounding bugs described in Part 1 above
+
+Phase 3: ADS-B Baseline Test (test_adsb_link.m)
+────────────────────────────────────────────────
+- Created test_adsb_link.m — simplified ADS-B PPM test to validate RF link
+- Purpose: strip away Mode 5 complexity, test bare hardware link first
+- Features:
+    • Auto gain calibration sweep (3 settings)
+    • 12 MSPS (corrected from 4 MSPS)
+    • movmean DC removal (replaced broken highpass approach)
+    • PlutoSDR complex signal fix (sig + 1i*1e-12)
+    • 5-cycle test with live BER plots
+- Result: PERFECT MATCH — 0 bit errors across all 5 cycles
+- This was the FIRST SUCCESSFUL COMMUNICATION
+
+Phase 4: demo_comm.m Rebuilt with Lessons Learned
+─────────────────────────────────────────────────
+- Rewrote demo_comm.m incorporating all 5 bug fixes:
+    • fs = 12 MSPS (was 4 MSPS)
+    • BPSK modulation with known preamble (no DSSS, no Gold code)
+    • movmean DC removal on real(IQ) (no highpass)
+    • CRC-16 only (MAC removed temporarily for incremental testing)
+    • Complex xcorr phase recovery for carrier phase ambiguity
+    • Polarity-tolerant BPSK demodulator
+- Frame formats:
+    • Interrogation: [Sync16][Type8][ID16][Challenge32][CRC16] = 88 bits
+    • Reply: [Sync16][Type8][ID16][Challenge32][IFF24][CRC16] = 112 bits
+- BPSK demodulator key innovation:
+    • xcorr(complex_rx, real_preamble) → abs() for phase-invariant peak detection
+    • angle(c(peak)) recovers unknown carrier phase θ between TX/RX LOs
+    • rx_rotated = rx * exp(-jθ) → real() gives clean ±1 BPSK symbols
+    • This solves the LO phase ambiguity problem inherent in separate oscillators
+
+Phase 5: Split into Ground Station + Aircraft Transponder
+──────────────────────────────────────────────────────────
+- Split test_adsb_link.m into two separate scripts for proper IFF protocol:
+
+### test_adsb_pluto.m — IFF Ground Station (ADALM Pluto)
+    Role: Interrogator
+    Step 1: TX interrogation on 1030 MHz
+        Frame: [DF=B0][StationID=1A2B][Mode=05][Challenge=D2CE21DA][CRC]
+        Hold TX for 3.0 seconds
+    Step 2: Switch to RX on 1090 MHz
+        Listen for up to 6.0 seconds for aircraft reply
+    Step 3: Decode reply → extract ICAO address → report identification
+    Output: "AIRCRAFT 4840D6 IDENTIFIED" or "NO REPLY"
+
+### test_adsb_zedboard.m — IFF Aircraft Transponder (ZedBoard FMCOMMS3)
+    Role: Transponder (runs autonomously — no PC console needed)
+    Step 1: Listen on 1030 MHz for interrogation
+        Validates DF=B0 sync header
+        Extracts ground station ID, mode code, challenge nonce
+    Step 2: Build reply with aircraft identity
+        Frame: [DF=8D][ICAO=4840D6][Squawk/IFF data][Challenge echo][CRC]
+    Step 3: TX reply on 1090 MHz (hold 4.0 seconds)
+    Confirmation: The RF reply IS the confirmation — ground station decodes it
+
+    IP Core Candidate Functions (for Vivado 2023.2 / HDL Coder):
+        adsb_preprocess()   — envelope + movmean DC removal
+                               HDL: sliding-window accumulator
+        adsb_framesync()    — bipolar preamble matched filter (96-tap)
+                               HDL: FIR with ROM coefficients
+        adsb_decode_bits()  — PPM half-period energy comparator
+                               HDL: adder + comparator (no divider)
+
+Phase 5 Protocol Flow:
+    Ground Station (Pluto)              Aircraft (ZedBoard)
+    ──────────────────                  ───────────────────
+    TX interrogation 1030 MHz ────────► RX + validate DF=B0
+                                         Build reply with ICAO
+    RX on 1090 MHz ◄──────────────────  TX reply 1090 MHz
+    Decode → ICAO = 4840D6
+    "AIRCRAFT IDENTIFIED"
+
+Run Order: ZedBoard first (starts listening), then Pluto (sends interrogation).
+
+================================================================================
+FILE INVENTORY (as of March 10, 2026)
+================================================================================
+
+matlab_codes/
+├── demo_comm.m            — Mode 5 IFF (BPSK + CRC-16, no DSSS/MAC yet)
+│                            12 MSPS, complex xcorr phase recovery
+│                            Two-phase challenge-response on 1030/1090 MHz
+│
+├── test_adsb_link.m       — Combined Pluto TX + ZedBoard RX ADS-B test
+│                            Auto gain calibration, 5 cycles, BER plots
+│                            *** 1st successful communication ***
+│
+├── test_adsb_pluto.m      — IFF Ground Station (Pluto interrogator)
+│                            TX interrogation 1030 MHz → RX reply 1090 MHz
+│                            Extracts ICAO address from aircraft reply
+│
+├── test_adsb_zedboard.m   — IFF Aircraft Transponder (ZedBoard)
+│                            RX interrogation 1030 MHz → TX reply 1090 MHz
+│                            IP core functions ready for HDL Coder
+│                            *** 2nd successful communication ***
+│
+├── reset_zedboard_ip.m    — Set ZedBoard IP via serial (COM8, 115200)
+│                            Must run after every ZedBoard power cycle
+│
+├── slow_simulation_IFF.m  — ZedBoard-only loopback test (legacy)
+│
+└── test5.m                — Early test script (legacy)
+
+documentation.doc          — This file (technical report + project log)
+README.md                  — Setup guide and run instructions
+
+================================================================================
+HARDWARE CONFIGURATION REFERENCE
+================================================================================
+
+Device          | Role              | IP/URI            | Interface
+────────────────|───────────────────|───────────────────|──────────
+ADALM Pluto SDR | Ground Station    | ip:192.168.2.1    | USB
+ZedBoard+FMCOMMS3| Aircraft Transponder| 192.168.1.10    | Ethernet
+                | (AD9361)          |                   |
+
+RF Connection: Pluto SMA ↔ ZedBoard SMA (direct cable, ~0 dB path loss)
+ZedBoard Serial: COM8, 115200 baud (for IP reset)
+
+Gain Settings (SMA cable):
+    TX Pluto:    -20 dB
+    TX ZedBoard: -20 dB
+    RX ZedBoard: +10 to +25 dB
+    RX Pluto:    +10 dB
+    Target: max(abs(rx)) = 0.2–0.6
+
+Frequencies:
+    1030 MHz — Interrogation (ground → aircraft)
+    1090 MHz — Reply (aircraft → ground)
+    12 MSPS  — Sample rate (12 samples/µs, ADS-B standard)
+
+================================================================================
+KNOWN ISSUES & TROUBLESHOOTING
+================================================================================
+
+1. "Failed to create context for uri: ip:192.168.1.10"
+   → ZedBoard IP not set. Run reset_zedboard_ip.m first.
+   → Check: PC Ethernet adapter at 192.168.1.x, subnet 255.255.255.0
+   → Verify: ping 192.168.1.10
+
+2. "Input X must be complex"
+   → PlutoSDR rejects real waveform. Ensure TX uses: sig + 1i*1e-12
+
+3. BER = 50% with high SNR
+   → LO phase ambiguity. Use complex xcorr for phase recovery (demo_comm.m)
+   → Or use envelope-based PPM decoder (test_adsb_*.m) which is phase-invariant
+
+4. All 1-bits decoded as 0 (exactly N errors = N ones in message)
+   → highpass() on envelope. Replace with movmean DC removal.
+
+5. ADC clipping (max > 1.0)
+   → Reduce TX gain or RX gain. For SMA cable: TX=-20, RX=+10.
+
+6. Timing: "NO REPLY" despite both devices working
+   → Start ZedBoard script FIRST (it listens), then Pluto (it transmits).
+   → ZedBoard listen window = 15 s per cycle. Start Pluto within that window.
