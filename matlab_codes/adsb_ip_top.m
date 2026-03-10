@@ -171,7 +171,13 @@ if ~preamble_locked && armed
             if rd > 96
                 rd = int32(1);
             end
-            c = c + corr_sr(rd) * KERNEL(j);
+            % Use add/subtract instead of multiply — KERNEL is only +1/-1
+            % This maps to LUT adders, saving all 96 DSP48 slices
+            if KERNEL(j) > int32(0)
+                c = c + corr_sr(rd);
+            else
+                c = c - corr_sr(rd);
+            end
             rd = rd + int32(1);
         end
 
@@ -194,7 +200,7 @@ if ~preamble_locked && armed
             % SNR check: best_corr >> 8 * 6433 >= 4 * corr_sum
             best_scaled = bitshift(best_corr, -8);
             snr_left  = best_scaled * int32(6433);
-            snr_right = SNR_THRESH * corr_sum;
+            snr_right = bitshift(corr_sum, 2);  % SNR_THRESH=4 → shift left 2
             snr_pass  = snr_left >= snr_right;
 
             % Start bit extraction
